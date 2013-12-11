@@ -117,6 +117,25 @@ const char* image_roots_descriptions_[] = {
   "kClassRoots",
 };
 
+// Annotator for the disassembler to dump thread offset functions.
+class OatAnnotator : public DisassemblerAnnotator {
+ public:
+  void Annotate(std::ostringstream& str, va_list ap) {
+    uint32_t offset = va_arg(ap, uint32_t);
+    size_t size_of_pointers = va_arg(ap, size_t);
+    switch (size_of_pointers) {
+    case 4:
+      Thread::DumpThreadOffset<4>(str, offset);
+      break;
+    case 8:
+      Thread::DumpThreadOffset<8>(str, offset);
+      break;
+    default:
+      LOG(FATAL) << "Invalid pointer size for disassember annotator";
+    }
+  }
+};
+
 class OatDumperOptions {
  public:
   OatDumperOptions(bool dump_raw_mapping_table,
@@ -146,7 +165,8 @@ class OatDumper {
       instruction_set_(oat_file_.GetOatHeader().GetInstructionSet()),
       disassembler_(Disassembler::Create(instruction_set_,
                                          new DisassemblerOptions(options_->absolute_addresses_,
-                                                                 oat_file.Begin()))) {
+                                                                 oat_file.Begin()),
+					&annotator_)) {
     AddAllOffsets();
   }
 
@@ -959,6 +979,7 @@ class OatDumper {
   InstructionSet instruction_set_;
   std::set<uintptr_t> offsets_;
   Disassembler* disassembler_;
+  OatAnnotator annotator_;
 };
 
 class ImageDumper {

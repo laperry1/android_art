@@ -343,4 +343,5 @@ JValue InvokeProxyInvocationHandler(ScopedObjectAccessAlreadyRunnable& soa, cons
     return zero;
   }
 }
+
 }  // namespace art

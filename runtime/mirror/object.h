@@ -319,6 +319,8 @@ class MANAGED LOCKABLE Object {
     SetFieldPtrWithSize<kTransactionActive, kCheckTransaction, kVerifyFlags>(
         field_offset, new_value, sizeof(void*));
   }
+  // Write barrier called post update to a reference bearing field.
+  static void WriteBarrierField(const Object* dst, MemberOffset offset, const Object* new_value);
 
   template<bool kTransactionActive, bool kCheckTransaction = true,
       VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags, typename T>
