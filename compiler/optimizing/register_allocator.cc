@@ -810,6 +810,7 @@ void RegisterAllocator::ConnectSiblings(LiveInterval* interval) {
                         : Location::StackSlot(interval->GetParent()->GetSpillSlot()));
   }
   UsePosition* use = current->GetFirstUse();
+  size_t safepoint_index = safepoints_.Size();
 
   // Walk over all siblings, updating locations of use positions, and
   // connecting them when they are adjacent.
@@ -837,8 +838,70 @@ void RegisterAllocator::ConnectSiblings(LiveInterval* interval) {
     if (next_sibling != nullptr
         && next_sibling->HasRegister()
         && current->GetEnd() == next_sibling->GetStart()) {
-      Location destination = ConvertToLocation(next_sibling);
-      InsertParallelMoveAt(current->GetEnd(), source, destination);
+      Location destination = next_sibling->ToLocation();
+      InsertParallelMoveAt(current->GetEnd(), interval->GetDefinedBy(), source, destination);
+    }
+
+    // At each safepoint, we record stack and register information.
+    // We iterate backwards to test safepoints in ascending order of positions,
+    // which is what LiveInterval::Covers is optimized for.
+    while (safepoint_index > 0) {
+      HInstruction* safepoint = safepoints_.Get(--safepoint_index);
+      size_t position = safepoint->GetLifetimePosition();
+
+      // Test that safepoints are ordered in the optimal way.
+      DCHECK(safepoint_index == 0
+             || safepoints_.Get(safepoint_index - 1)->GetLifetimePosition() >= position);
+
+      if (current->IsDeadAt(position)) {
+        break;
+      } else if (!current->Covers(position)) {
+        continue;
+      } else if (interval->GetStart() == position) {
+        // The safepoint is for this instruction, so the location of the instruction
+        // does not need to be saved.
+        continue;
+      }
+
+      LocationSummary* locations = safepoint->GetLocations();
+      if ((current->GetType() == Primitive::kPrimNot) && current->GetParent()->HasSpillSlot()) {
+        locations->SetStackBit(current->GetParent()->GetSpillSlot() / kVRegSize);
+      }
+
+      switch (source.GetKind()) {
+        case Location::kRegister: {
+          locations->AddLiveRegister(source);
+          if (kIsDebugBuild && locations->OnlyCallsOnSlowPath()) {
+            DCHECK_LE(locations->GetNumberOfLiveRegisters(),
+                      maximum_number_of_live_core_registers_ +
+                      maximum_number_of_live_fp_registers_);
+          }
+          if (current->GetType() == Primitive::kPrimNot) {
+            locations->SetRegisterBit(source.reg());
+          }
+          break;
+        }
+        case Location::kFpuRegister: {
+          locations->AddLiveRegister(source);
+          break;
+        }
+
+        case Location::kRegisterPair:
+        case Location::kFpuRegisterPair: {
+          locations->AddLiveRegister(source.ToLow());
+          locations->AddLiveRegister(source.ToHigh());
+          break;
+        }
+        case Location::kStackSlot:  // Fall-through
+        case Location::kDoubleStackSlot:  // Fall-through
+        case Location::kConstant: {
+          // Nothing to do.
+          break;
+        }
+        default: {
+          LOG(FATAL) << "Unexpected location for object";
+        }
+      }
     }
     current = next_sibling;
   } while (current != nullptr);
