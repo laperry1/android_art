@@ -1279,8 +1279,9 @@ void InstructionCodeGeneratorX86_64::VisitArrayLength(HArrayLength* instruction)
 }
 
 void LocationsBuilderX86_64::VisitBoundsCheck(HBoundsCheck* instruction) {
-  LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(instruction);
-  locations->SetInAt(0, Location::RequiresRegister());
+  LocationSummary* locations =
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kNoCall);
+  locations->SetInAt(0, Location::RegisterOrConstant(instruction->InputAt(0)));
   locations->SetInAt(1, Location::RequiresRegister());
   // TODO: Have a normalization phase that makes this instruction never used.
   locations->SetOut(Location::SameAsFirstInput());
@@ -1289,15 +1290,20 @@ void LocationsBuilderX86_64::VisitBoundsCheck(HBoundsCheck* instruction) {
 
 void InstructionCodeGeneratorX86_64::VisitBoundsCheck(HBoundsCheck* instruction) {
   LocationSummary* locations = instruction->GetLocations();
-  SlowPathCode* slow_path = new (GetGraph()->GetArena()) BoundsCheckSlowPathX86_64(
-      instruction->GetDexPc(), locations->InAt(0), locations->InAt(1));
+  Location index_loc = locations->InAt(0);
+  Location length_loc = locations->InAt(1);
+  SlowPathCodeX86_64* slow_path =
+    new (GetGraph()->GetArena()) BoundsCheckSlowPathX86_64(instruction, index_loc, length_loc);
   codegen_->AddSlowPath(slow_path);
 
-  CpuRegister index = locations->InAt(0).AsX86_64().AsCpuRegister();
-  CpuRegister length = locations->InAt(1).AsX86_64().AsCpuRegister();
-
-  __ cmpl(index, length);
-  __ j(kAboveEqual, slow_path->GetEntryLabel());
+  CpuRegister length = length_loc.AsRegister<CpuRegister>();
+  if (index_loc.IsConstant()) {
+    int32_t value = CodeGenerator::GetInt32ValueOf(index_loc.GetConstant());
+    __ cmpl(length, Immediate(value));
+  } else {
+    __ cmpl(length, index_loc.AsRegister<CpuRegister>());
+  }
+  __ j(kBelowEqual, slow_path->GetEntryLabel());
 }
 
 void CodeGeneratorX86_64::MarkGCCard(CpuRegister temp,
