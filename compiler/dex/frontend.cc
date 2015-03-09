@@ -644,8 +644,15 @@ static CompiledMethod* CompileMethod(CompilerDriver& driver,
     return nullptr;
   }
 
-  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  CompilationUnit cu(driver.GetArenaPool());
+  DCHECK(driver->GetCompilerOptions().IsCompilationEnabled());
+
+  Runtime* const runtime = Runtime::Current();
+  ClassLinker* const class_linker = runtime->GetClassLinker();
+  InstructionSet instruction_set = driver->GetInstructionSet();
+  if (instruction_set == kArm) {
+    instruction_set = kThumb2;
+  }
+  CompilationUnit cu(runtime->GetArenaPool(), instruction_set, driver, class_linker);
 
   cu.compiler_driver = &driver;
   cu.class_linker = class_linker;

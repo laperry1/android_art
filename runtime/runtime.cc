@@ -189,6 +189,14 @@ Runtime::~Runtime() {
   // Make sure all other non-daemon threads have terminated, and all daemon threads are suspended.
   delete thread_list_;
 
+  // Delete the JIT after thread list to ensure that there is no remaining threads which could be
+  // accessing the instrumentation when we delete it.
+  if (jit_.get() != nullptr) {
+    VLOG(jit) << "Deleting jit";
+    jit_.reset(nullptr);
+  }
+  arena_pool_.reset();
+
   // Shutdown the fault manager if it was initialized.
   fault_manager.Shutdown();
 
@@ -708,6 +716,7 @@ bool Runtime::Init(const RuntimeOptions& raw_options, bool ignore_unrecognized) 
 
   max_spins_before_thin_lock_inflation_ = options->max_spins_before_thin_lock_inflation_;
 
+  arena_pool_.reset(new ArenaPool);
   monitor_list_ = new MonitorList;
   monitor_pool_ = MonitorPool::Create();
   thread_list_ = new ThreadList;

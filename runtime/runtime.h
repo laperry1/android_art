@@ -27,6 +27,8 @@
 #include <vector>
 
 #include "base/allocator.h"
+#include "base/arena_allocator.h"
+#include "base/macros.h"
 #include "compiler_callbacks.h"
 #include "gc_root.h"
 #include "instrumentation.h"
@@ -493,6 +495,15 @@ class Runtime {
     return kDefaultInstructionSetFeatures;
   }
 
+  void CreateJit();
+
+  ArenaPool* GetArenaPool() {
+    return arena_pool_.get();
+  }
+  const ArenaPool* GetArenaPool() const {
+    return arena_pool_.get();
+  }
+
  private:
   static void InitPlatformSignalHandlers();
 
@@ -553,6 +564,8 @@ class Runtime {
   size_t default_stack_size_;
 
   gc::Heap* heap_;
+
+  std::unique_ptr<ArenaPool> arena_pool_;
 
   // The number of spins that are done before thread suspension is used to forcibly inflate.
   size_t max_spins_before_thin_lock_inflation_;

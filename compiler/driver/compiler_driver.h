@@ -380,12 +380,6 @@ class CompilerDriver {
     support_boot_image_fixup_ = support_boot_image_fixup;
   }
 
-  ArenaPool* GetArenaPool() {
-    return &arena_pool_;
-  }
-  const ArenaPool* GetArenaPool() const {
-    return &arena_pool_;
-  }
   SwapAllocator<void>& GetSwapSpaceAllocator() {
     return *swap_space_allocator_.get();
   }
@@ -832,18 +826,6 @@ class CompilerDriver {
   DexToDexCompilerFn dex_to_dex_compiler_;
 
   void* compiler_context_;
-
-  pthread_key_t tls_key_;
-
-  // Arena pool used by the compiler.
-  ArenaPool arena_pool_;
-
-  typedef void (*CompilerEnableAutoElfLoadingFn)(CompilerDriver& driver);
-  CompilerEnableAutoElfLoadingFn compiler_enable_auto_elf_loading_;
-
-  typedef const void* (*CompilerGetMethodCodeAddrFn)
-      (const CompilerDriver& driver, const CompiledMethod* cm, const mirror::ArtMethod* method);
-  CompilerGetMethodCodeAddrFn compiler_get_method_code_addr_;
 
   bool support_boot_image_fixup_;
 
