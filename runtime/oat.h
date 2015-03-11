@@ -29,8 +29,8 @@ namespace art {
 
 class PACKED(4) OatHeader {
  public:
-  static const uint8_t kOatMagic[4];
-  static const uint8_t kOatVersion[4];
+  static constexpr uint8_t kOatMagic[] = { 'o', 'a', 't', '\n' };
+  static constexpr uint8_t kOatVersion[] = { '0', '5', '9', '\0' };
 
   static constexpr const char* kImageLocationKey = "image-location";
   static constexpr const char* kDex2OatCmdLineKey = "dex2oat-cmdline";
