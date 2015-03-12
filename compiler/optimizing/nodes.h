@@ -91,6 +91,19 @@ class HGraph : public ArenaObject {
 
   void AddBlock(HBasicBlock* block);
 
+  // Try building the SSA form of this graph, with dominance computation and loop
+  // recognition. Returns whether it was successful in doing all these steps.
+  bool TryBuildingSsa() {
+    BuildDominatorTree();
+    // The SSA builder requires loops to all be natural. Specifically, the dead phi
+    // elimination phase checks the consistency of the graph when doing a post-order
+    // visit for eliminating dead phis: a dead phi can only have loop header phi
+    // users remaining when being visited.
+    if (!AnalyzeNaturalLoops()) return false;
+    TransformToSsa();
+    return true;
+  }
+
   void BuildDominatorTree();
   void TransformToSSA();
   void SimplifyCFG();
