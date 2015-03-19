@@ -50,6 +50,7 @@ define build-art-executable
   art_multilib := $(7)
   art_static_or_shared := $(8)
   art_out_binary_name :=
+  art_static_libraries := $(8)
 
   include $(CLEAR_VARS)
   LOCAL_CPP_EXTENSION := $(ART_CPP_EXTENSION)
@@ -62,6 +63,10 @@ define build-art-executable
   else
     LOCAL_SHARED_LIBRARIES += $$(art_libraries)
   endif
+  LOCAL_C_INCLUDES += $(ART_C_INCLUDES) art/runtime $$(art_c_includes)
+  LOCAL_SHARED_LIBRARIES += $$(art_shared_libraries)
+  LOCAL_STATIC_LIBRARIES += $$(art_static_libraries)
+  LOCAL_WHOLE_STATIC_LIBRARIES += libsigchain
 
   ifeq ($$(art_ndebug_or_debug),ndebug)
     LOCAL_MODULE := $$(art_executable)
