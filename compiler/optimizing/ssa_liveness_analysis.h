@@ -425,6 +425,167 @@ class LiveInterval : public ArenaObject {
   }
 
   LiveInterval* GetNextSibling() const { return next_sibling_; }
+  LiveInterval* GetLastSibling() {
+    LiveInterval* result = this;
+    while (result->next_sibling_ != nullptr) {
+      result = result->next_sibling_;
+    }
+    return result;
+  }
+
+  // Returns the first register hint that is at least free before
+  // the value contained in `free_until`. If none is found, returns
+  // `kNoRegister`.
+  int FindFirstRegisterHint(size_t* free_until) const;
+
+  // If there is enough at the definition site to find a register (for example
+  // it uses the same input as the first input), returns the register as a hint.
+  // Returns kNoRegister otherwise.
+  int FindHintAtDefinition() const;
+
+  // Returns whether the interval needs two (Dex virtual register size `kVRegSize`)
+  // slots for spilling.
+  bool NeedsTwoSpillSlots() const;
+
+  bool IsFloatingPoint() const {
+    return type_ == Primitive::kPrimFloat || type_ == Primitive::kPrimDouble;
+  }
+
+  // Converts the location of the interval to a `Location` object.
+  Location ToLocation() const;
+
+  // Returns the location of the interval following its siblings at `position`.
+  Location GetLocationAt(size_t position);
+
+  // Finds the sibling that is defined at `position`.
+  LiveInterval* GetSiblingAt(size_t position);
+
+  // Returns whether `other` and `this` share the same kind of register.
+  bool SameRegisterKind(Location other) const;
+  bool SameRegisterKind(const LiveInterval& other) const {
+    return IsFloatingPoint() == other.IsFloatingPoint();
+  }
+
+  bool HasHighInterval() const {
+    return IsLowInterval();
+  }
+
+  bool HasLowInterval() const {
+    return IsHighInterval();
+  }
+
+  LiveInterval* GetLowInterval() const {
+    DCHECK(HasLowInterval());
+    return high_or_low_interval_;
+  }
+
+  LiveInterval* GetHighInterval() const {
+    DCHECK(HasHighInterval());
+    return high_or_low_interval_;
+  }
+
+  bool IsHighInterval() const {
+    return GetParent()->is_high_interval_;
+  }
+
+  bool IsLowInterval() const {
+    return !IsHighInterval() && (GetParent()->high_or_low_interval_ != nullptr);
+  }
+
+  void SetLowInterval(LiveInterval* low) {
+    DCHECK(IsHighInterval());
+    high_or_low_interval_ = low;
+  }
+
+  void SetHighInterval(LiveInterval* high) {
+    DCHECK(IsLowInterval());
+    high_or_low_interval_ = high;
+  }
+
+  void AddHighInterval(bool is_temp = false) {
+    DCHECK_EQ(GetParent(), this);
+    DCHECK(!HasHighInterval());
+    DCHECK(!HasLowInterval());
+    high_or_low_interval_ = new (allocator_) LiveInterval(
+        allocator_, type_, defined_by_, false, kNoRegister, is_temp, false, true);
+    high_or_low_interval_->high_or_low_interval_ = this;
+    if (first_range_ != nullptr) {
+      high_or_low_interval_->first_range_ = first_range_->Dup(allocator_);
+      high_or_low_interval_->last_range_ = high_or_low_interval_->first_range_->GetLastRange();
+    }
+    if (first_use_ != nullptr) {
+      high_or_low_interval_->first_use_ = first_use_->Dup(allocator_);
+    }
+  }
+
+  // Returns whether an interval, when it is non-split, is using
+  // the same register of one of its input.
+  bool IsUsingInputRegister() const {
+    if (defined_by_ != nullptr && !IsSplit()) {
+      for (HInputIterator it(defined_by_); !it.Done(); it.Advance()) {
+        LiveInterval* interval = it.Current()->GetLiveInterval();
+
+        // Find the interval that covers `defined_by`_.
+        while (interval != nullptr && !interval->Covers(defined_by_->GetLifetimePosition())) {
+          interval = interval->GetNextSibling();
+        }
+
+        // Check if both intervals have the same register of the same kind.
+        if (interval != nullptr
+            && interval->SameRegisterKind(*this)
+            && interval->GetRegister() == GetRegister()) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Returns whether an interval, when it is non-split, can safely use
+  // the same register of one of its input. Note that this method requires
+  // IsUsingInputRegister() to be true.
+  bool CanUseInputRegister() const {
+    DCHECK(IsUsingInputRegister());
+    if (defined_by_ != nullptr && !IsSplit()) {
+      LocationSummary* locations = defined_by_->GetLocations();
+      if (locations->OutputCanOverlapWithInputs()) {
+        return false;
+      }
+      for (HInputIterator it(defined_by_); !it.Done(); it.Advance()) {
+        LiveInterval* interval = it.Current()->GetLiveInterval();
+
+        // Find the interval that covers `defined_by`_.
+        while (interval != nullptr && !interval->Covers(defined_by_->GetLifetimePosition())) {
+          interval = interval->GetNextSibling();
+        }
+
+        if (interval != nullptr
+            && interval->SameRegisterKind(*this)
+            && interval->GetRegister() == GetRegister()) {
+          // We found the input that has the same register. Check if it is live after
+          // `defined_by`_.
+          return !interval->Covers(defined_by_->GetLifetimePosition() + 1);
+        }
+      }
+    }
+    LOG(FATAL) << "Unreachable";
+    UNREACHABLE();
+  }
+
+  void AddSafepoint(HInstruction* instruction) {
+    SafepointPosition* safepoint = new (allocator_) SafepointPosition(instruction);
+    if (first_safepoint_ == nullptr) {
+      first_safepoint_ = last_safepoint_ = safepoint;
+    } else {
+      DCHECK_LT(last_safepoint_->GetPosition(), safepoint->GetPosition());
+      last_safepoint_->SetNext(safepoint);
+      last_safepoint_ = safepoint;
+    }
+  }
+
+  SafepointPosition* GetFirstSafepoint() const {
+    return first_safepoint_;
+  }
 
  private:
   ArenaAllocator* const allocator_;
