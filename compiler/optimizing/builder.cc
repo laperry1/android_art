@@ -514,7 +514,11 @@ bool HGraphBuilder::AnalyzeDexInstruction(const Instruction& instruction, int32_
       HLongConstant* constant = GetLongConstant(value);
       UpdateLocal(register_index, constant);
       break;
-    }
+    default:
+      LOG(FATAL) << "Unknown element width for " << payload->element_width;
+  }
+  graph_->SetHasArrayAccesses(true);
+}
 
     case Instruction::CONST_WIDE: {
       int32_t register_index = instruction.VRegA();
