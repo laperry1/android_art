@@ -127,6 +127,20 @@ class Monitor {
   static bool Deflate(Thread* self, mirror::Object* obj)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+#ifndef __LP64__
+  void* operator new(size_t size) {
+    // Align Monitor* as per the monitor ID field size in the lock word.
+    void* result;
+    int error = posix_memalign(&result, LockWord::kMonitorIdAlignment, size);
+    CHECK_EQ(error, 0) << strerror(error);
+    return result;
+  }
+
+  void operator delete(void* ptr) {
+    free(ptr);
+  }
+#endif
+
  private:
   explicit Monitor(Thread* self, Thread* owner, mirror::Object* obj, int32_t hash_code)
         SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
