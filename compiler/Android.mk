@@ -195,8 +195,8 @@ define build-libart-compiler
   endif
 
   ifeq ($$(art_target_or_host),target)
-    LOCAL_CC  := $$(TARGET_TOOLCHAIN_ROOT)/../arm-linux-androideabi-4.8/bin/arm-linux-androideabi-gcc$$(HOST_EXECUTABLE_SUFFIX)
-    LOCAL_CXX := $$(TARGET_TOOLCHAIN_ROOT)/../arm-linux-androideabi-4.8/bin/arm-linux-androideabi-g++$$(HOST_EXECUTABLE_SUFFIX)
+    LOCAL_CC  := $$(TARGET_TOOLCHAIN_ROOT)/../arm-linux-androideabi-5.1/bin/arm-linux-androideabi-gcc$$(HOST_EXECUTABLE_SUFFIX)
+    LOCAL_CXX := $$(TARGET_TOOLCHAIN_ROOT)/../arm-linux-androideabi-5.1/bin/arm-linux-androideabi-g++$$(HOST_EXECUTABLE_SUFFIX)
   endif
 
   LOCAL_MODULE_TAGS := optional
