@@ -839,13 +839,7 @@ static int dex2oat(int argc, char** argv) {
   TimingLogger timings("compiler", false, false);
   CumulativeLogger compiler_phases_timings("compilation times");
 
-    bool debuggable = false;
-    bool include_patch_information = CompilerOptions::kDefaultIncludePatchInformation;
-    bool include_debug_symbols = kIsDebugBuild;
-    bool watch_dog_enabled = true;
-    bool generate_gdb_information = kIsDebugBuild;
-    bool abort_on_hard_verifier_error = false;
-    bool requested_specific_compiler = false;
+  InitLogging(argv);
 
   // Skip over argv[0].
   argv++;
@@ -929,253 +923,91 @@ static int dex2oat(int argc, char** argv) {
       if (!ParseInt(zip_fd_str, &zip_fd)) {
         Usage("Failed to parse --zip-fd argument '%s' as an integer", zip_fd_str);
       }
-      if (option.starts_with("--dex-file=")) {
-        dex_filenames_.push_back(option.substr(strlen("--dex-file=")).data());
-      } else if (option.starts_with("--dex-location=")) {
-        dex_locations_.push_back(option.substr(strlen("--dex-location=")).data());
-      } else if (option.starts_with("--zip-fd=")) {
-        const char* zip_fd_str = option.substr(strlen("--zip-fd=")).data();
-        if (!ParseInt(zip_fd_str, &zip_fd_)) {
-          Usage("Failed to parse --zip-fd argument '%s' as an integer", zip_fd_str);
-        }
-        if (zip_fd_ < 0) {
-          Usage("--zip-fd passed a negative value %d", zip_fd_);
-        }
-      } else if (option.starts_with("--zip-location=")) {
-        zip_location_ = option.substr(strlen("--zip-location=")).data();
-      } else if (option.starts_with("--oat-file=")) {
-        oat_filename_ = option.substr(strlen("--oat-file=")).data();
-      } else if (option.starts_with("--oat-symbols=")) {
-        oat_symbols = option.substr(strlen("--oat-symbols=")).data();
-      } else if (option.starts_with("--oat-fd=")) {
-        const char* oat_fd_str = option.substr(strlen("--oat-fd=")).data();
-        if (!ParseInt(oat_fd_str, &oat_fd_)) {
-          Usage("Failed to parse --oat-fd argument '%s' as an integer", oat_fd_str);
-        }
-        if (oat_fd_ < 0) {
-          Usage("--oat-fd passed a negative value %d", oat_fd_);
-        }
-      } else if (option == "--watch-dog") {
-        watch_dog_enabled = true;
-      } else if (option == "--no-watch-dog") {
-        watch_dog_enabled = false;
-      } else if (option == "--gen-gdb-info") {
-        generate_gdb_information = true;
-        // Debug symbols are needed for gdb information.
-        include_debug_symbols = true;
-      } else if (option == "--no-gen-gdb-info") {
-        generate_gdb_information = false;
-      } else if (option.starts_with("-j")) {
-        const char* thread_count_str = option.substr(strlen("-j")).data();
-        if (!ParseUint(thread_count_str, &thread_count_)) {
-          Usage("Failed to parse -j argument '%s' as an integer", thread_count_str);
-        }
-      } else if (option.starts_with("--oat-location=")) {
-        oat_location_ = option.substr(strlen("--oat-location=")).data();
-      } else if (option.starts_with("--image=")) {
-        image_filename_ = option.substr(strlen("--image=")).data();
-      } else if (option.starts_with("--image-classes=")) {
-        image_classes_filename_ = option.substr(strlen("--image-classes=")).data();
-      } else if (option.starts_with("--image-classes-zip=")) {
-        image_classes_zip_filename_ = option.substr(strlen("--image-classes-zip=")).data();
-      } else if (option.starts_with("--compiled-classes=")) {
-        compiled_classes_filename_ = option.substr(strlen("--compiled-classes=")).data();
-      } else if (option.starts_with("--compiled-classes-zip=")) {
-        compiled_classes_zip_filename_ = option.substr(strlen("--compiled-classes-zip=")).data();
-      } else if (option.starts_with("--base=")) {
-        const char* image_base_str = option.substr(strlen("--base=")).data();
-        char* end;
-        image_base_ = strtoul(image_base_str, &end, 16);
-        if (end == image_base_str || *end != '\0') {
-          Usage("Failed to parse hexadecimal value for option %s", option.data());
-        }
-      } else if (option.starts_with("--boot-image=")) {
-        boot_image_filename = option.substr(strlen("--boot-image=")).data();
-      } else if (option.starts_with("--android-root=")) {
-        android_root_ = option.substr(strlen("--android-root=")).data();
-      } else if (option.starts_with("--instruction-set=")) {
-        StringPiece instruction_set_str = option.substr(strlen("--instruction-set=")).data();
-        // StringPiece is not necessarily zero-terminated, so need to make a copy and ensure it.
-        std::unique_ptr<char[]> buf(new char[instruction_set_str.length() + 1]);
-        strncpy(buf.get(), instruction_set_str.data(), instruction_set_str.length());
-        buf.get()[instruction_set_str.length()] = 0;
-        instruction_set_ = GetInstructionSetFromString(buf.get());
-        // arm actually means thumb2.
-        if (instruction_set_ == InstructionSet::kArm) {
-          instruction_set_ = InstructionSet::kThumb2;
-        }
-      } else if (option.starts_with("--instruction-set-variant=")) {
-        StringPiece str = option.substr(strlen("--instruction-set-variant=")).data();
-        instruction_set_features_.reset(
-            InstructionSetFeatures::FromVariant(instruction_set_, str.as_string(), &error_msg));
-        if (instruction_set_features_.get() == nullptr) {
-          Usage("%s", error_msg.c_str());
-        }
-      } else if (option.starts_with("--instruction-set-features=")) {
-        StringPiece str = option.substr(strlen("--instruction-set-features=")).data();
-        if (instruction_set_features_.get() == nullptr) {
-          instruction_set_features_.reset(
-              InstructionSetFeatures::FromVariant(instruction_set_, "default", &error_msg));
-          if (instruction_set_features_.get() == nullptr) {
-            Usage("Problem initializing default instruction set features variant: %s",
-                  error_msg.c_str());
-          }
-        }
-        instruction_set_features_.reset(
-            instruction_set_features_->AddFeaturesFromString(str.as_string(), &error_msg));
-        if (instruction_set_features_.get() == nullptr) {
-          Usage("Error parsing '%s': %s", option.data(), error_msg.c_str());
-        }
-      } else if (option.starts_with("--compiler-backend=")) {
-        requested_specific_compiler = true;
-        StringPiece backend_str = option.substr(strlen("--compiler-backend=")).data();
-        if (backend_str == "Quick") {
-          compiler_kind_ = Compiler::kQuick;
-        } else if (backend_str == "Optimizing") {
-          compiler_kind_ = Compiler::kOptimizing;
-        } else {
-          Usage("Unknown compiler backend: %s", backend_str.data());
-        }
-      } else if (option.starts_with("--compiler-filter=")) {
-        requested_specific_compiler = true;
-        compiler_filter_string = option.substr(strlen("--compiler-filter=")).data();
-      } else if (option == "--compile-pic") {
-        compile_pic = true;
-      } else if (option.starts_with("--huge-method-max=")) {
-        const char* threshold = option.substr(strlen("--huge-method-max=")).data();
-        if (!ParseInt(threshold, &huge_method_threshold)) {
-          Usage("Failed to parse --huge-method-max '%s' as an integer", threshold);
-        }
-        if (huge_method_threshold < 0) {
-          Usage("--huge-method-max passed a negative value %s", huge_method_threshold);
-        }
-      } else if (option.starts_with("--large-method-max=")) {
-        const char* threshold = option.substr(strlen("--large-method-max=")).data();
-        if (!ParseInt(threshold, &large_method_threshold)) {
-          Usage("Failed to parse --large-method-max '%s' as an integer", threshold);
-        }
-        if (large_method_threshold < 0) {
-          Usage("--large-method-max passed a negative value %s", large_method_threshold);
-        }
-      } else if (option.starts_with("--small-method-max=")) {
-        const char* threshold = option.substr(strlen("--small-method-max=")).data();
-        if (!ParseInt(threshold, &small_method_threshold)) {
-          Usage("Failed to parse --small-method-max '%s' as an integer", threshold);
-        }
-        if (small_method_threshold < 0) {
-          Usage("--small-method-max passed a negative value %s", small_method_threshold);
-        }
-      } else if (option.starts_with("--tiny-method-max=")) {
-        const char* threshold = option.substr(strlen("--tiny-method-max=")).data();
-        if (!ParseInt(threshold, &tiny_method_threshold)) {
-          Usage("Failed to parse --tiny-method-max '%s' as an integer", threshold);
-        }
-        if (tiny_method_threshold < 0) {
-          Usage("--tiny-method-max passed a negative value %s", tiny_method_threshold);
-        }
-      } else if (option.starts_with("--num-dex-methods=")) {
-        const char* threshold = option.substr(strlen("--num-dex-methods=")).data();
-        if (!ParseInt(threshold, &num_dex_methods_threshold)) {
-          Usage("Failed to parse --num-dex-methods '%s' as an integer", threshold);
-        }
-        if (num_dex_methods_threshold < 0) {
-          Usage("--num-dex-methods passed a negative value %s", num_dex_methods_threshold);
-        }
-      } else if (option == "--host") {
-        is_host_ = true;
-      } else if (option == "--runtime-arg") {
-        if (++i >= argc) {
-          Usage("Missing required argument for --runtime-arg");
-        }
-        if (log_options) {
-          LOG(INFO) << "dex2oat: option[" << i << "]=" << argv[i];
-        }
-        runtime_args_.push_back(argv[i]);
-      } else if (option == "--dump-timing") {
-        dump_timing_ = true;
-      } else if (option == "--dump-passes") {
-        dump_passes_ = true;
-      } else if (option.starts_with("--dump-cfg=")) {
-        dump_cfg_file_name_ = option.substr(strlen("--dump-cfg=")).data();
-      } else if (option == "--dump-stats") {
-        dump_stats_ = true;
-      } else if (option == "--include-debug-symbols" || option == "--no-strip-symbols") {
-        include_debug_symbols = true;
-      } else if (option == "--no-include-debug-symbols" || option == "--strip-symbols") {
-        include_debug_symbols = false;
-        generate_gdb_information = false;  // Depends on debug symbols, see above.
-      } else if (option == "--debuggable") {
-        debuggable = true;
-      } else if (option.starts_with("--profile-file=")) {
-        profile_file_ = option.substr(strlen("--profile-file=")).data();
-        VLOG(compiler) << "dex2oat: profile file is " << profile_file_;
-      } else if (option == "--no-profile-file") {
-        // No profile
-      } else if (option.starts_with("--top-k-profile-threshold=")) {
-        ParseDouble(option.data(), '=', 0.0, 100.0, &top_k_profile_threshold);
-      } else if (option == "--print-pass-names") {
-        pass_manager_options.SetPrintPassNames(true);
-      } else if (option.starts_with("--disable-passes=")) {
-        const std::string disable_passes = option.substr(strlen("--disable-passes=")).data();
-        pass_manager_options.SetDisablePassList(disable_passes);
-      } else if (option.starts_with("--print-passes=")) {
-        const std::string print_passes = option.substr(strlen("--print-passes=")).data();
-        pass_manager_options.SetPrintPassList(print_passes);
-      } else if (option == "--print-all-passes") {
-        pass_manager_options.SetPrintAllPasses();
-      } else if (option.starts_with("--dump-cfg-passes=")) {
-        const std::string dump_passes_string = option.substr(strlen("--dump-cfg-passes=")).data();
-        pass_manager_options.SetDumpPassList(dump_passes_string);
-      } else if (option == "--print-pass-options") {
-        pass_manager_options.SetPrintPassOptions(true);
-      } else if (option.starts_with("--pass-options=")) {
-        const std::string options = option.substr(strlen("--pass-options=")).data();
-        pass_manager_options.SetOverriddenPassOptions(options);
-      } else if (option == "--include-patch-information") {
-        include_patch_information = true;
-      } else if (option == "--no-include-patch-information") {
-        include_patch_information = false;
-      } else if (option.starts_with("--verbose-methods=")) {
-        // TODO: rather than switch off compiler logging, make all VLOG(compiler) messages
-        //       conditional on having verbost methods.
-        gLogVerbosity.compiler = false;
-        Split(option.substr(strlen("--verbose-methods=")).ToString(), ',', &verbose_methods_);
-      } else if (option.starts_with("--dump-init-failures=")) {
-        std::string file_name = option.substr(strlen("--dump-init-failures=")).data();
-        init_failure_output_.reset(new std::ofstream(file_name));
-        if (init_failure_output_.get() == nullptr) {
-          LOG(ERROR) << "Failed to allocate ofstream";
-        } else if (init_failure_output_->fail()) {
-          LOG(ERROR) << "Failed to open " << file_name << " for writing the initialization "
-                     << "failures.";
-          init_failure_output_.reset();
-        }
-      } else if (option.starts_with("--swap-file=")) {
-        swap_file_name_ = option.substr(strlen("--swap-file=")).data();
-      } else if (option.starts_with("--swap-fd=")) {
-        const char* swap_fd_str = option.substr(strlen("--swap-fd=")).data();
-        if (!ParseInt(swap_fd_str, &swap_fd_)) {
-          Usage("Failed to parse --swap-fd argument '%s' as an integer", swap_fd_str);
-        }
-        if (swap_fd_ < 0) {
-          Usage("--swap-fd passed a negative value %d", swap_fd_);
-        }
-      } else if (option == "--abort-on-hard-verifier-error") {
-        abort_on_hard_verifier_error = true;
-      } else {
-        Usage("Unknown argument %s", option.data());
+      if (zip_fd < 0) {
+        Usage("--zip-fd passed a negative value %d", zip_fd);
       }
-    }
-
-    image_ = (!image_filename_.empty());
-    if (!requested_specific_compiler && !kUseOptimizingCompiler) {
-      // If no specific compiler is requested, the current behavior is
-      // to compile the boot image with Quick, and the rest with Optimizing.
-      compiler_kind_ = image_ ? Compiler::kQuick : Compiler::kOptimizing;
-    }
-
-    if (compiler_kind_ == Compiler::kOptimizing) {
-      // Optimizing only supports PIC mode.
+    } else if (option.starts_with("--zip-location=")) {
+      zip_location = option.substr(strlen("--zip-location=")).data();
+    } else if (option.starts_with("--oat-file=")) {
+      oat_filename = option.substr(strlen("--oat-file=")).data();
+    } else if (option.starts_with("--oat-symbols=")) {
+      oat_symbols = option.substr(strlen("--oat-symbols=")).data();
+    } else if (option.starts_with("--oat-fd=")) {
+      const char* oat_fd_str = option.substr(strlen("--oat-fd=")).data();
+      if (!ParseInt(oat_fd_str, &oat_fd)) {
+        Usage("Failed to parse --oat-fd argument '%s' as an integer", oat_fd_str);
+      }
+      if (oat_fd < 0) {
+        Usage("--oat-fd passed a negative value %d", oat_fd);
+      }
+    } else if (option == "--watch-dog") {
+      watch_dog_enabled = true;
+    } else if (option == "--no-watch-dog") {
+      watch_dog_enabled = false;
+    } else if (option == "--gen-gdb-info") {
+      generate_gdb_information = true;
+      // Debug symbols are needed for gdb information.
+      include_debug_symbols = true;
+    } else if (option == "--no-gen-gdb-info") {
+      generate_gdb_information = false;
+    } else if (option.starts_with("-j")) {
+      const char* thread_count_str = option.substr(strlen("-j")).data();
+      if (!ParseInt(thread_count_str, &thread_count)) {
+        Usage("Failed to parse -j argument '%s' as an integer", thread_count_str);
+      }
+    } else if (option.starts_with("--oat-location=")) {
+      oat_location = option.substr(strlen("--oat-location=")).data();
+    } else if (option.starts_with("--bitcode=")) {
+      bitcode_filename = option.substr(strlen("--bitcode=")).data();
+    } else if (option.starts_with("--image=")) {
+      image_filename = option.substr(strlen("--image=")).data();
+    } else if (option.starts_with("--image-classes=")) {
+      image_classes_filename = option.substr(strlen("--image-classes=")).data();
+    } else if (option.starts_with("--image-classes-zip=")) {
+      image_classes_zip_filename = option.substr(strlen("--image-classes-zip=")).data();
+    } else if (option.starts_with("--compiled-classes=")) {
+      compiled_classes_filename = option.substr(strlen("--compiled-classes=")).data();
+    } else if (option.starts_with("--compiled-classes-zip=")) {
+      compiled_classes_zip_filename = option.substr(strlen("--compiled-classes-zip=")).data();
+    } else if (option.starts_with("--base=")) {
+      const char* image_base_str = option.substr(strlen("--base=")).data();
+      char* end;
+      image_base = strtoul(image_base_str, &end, 16);
+      if (end == image_base_str || *end != '\0') {
+        Usage("Failed to parse hexadecimal value for option %s", option.data());
+      }
+    } else if (option.starts_with("--boot-image=")) {
+      boot_image_filename = option.substr(strlen("--boot-image=")).data();
+    } else if (option.starts_with("--android-root=")) {
+      android_root = option.substr(strlen("--android-root=")).data();
+    } else if (option.starts_with("--instruction-set=")) {
+      StringPiece instruction_set_str = option.substr(strlen("--instruction-set=")).data();
+      if (instruction_set_str == "arm") {
+        instruction_set = kThumb2;
+      } else if (instruction_set_str == "arm64") {
+        instruction_set = kArm64;
+      } else if (instruction_set_str == "mips") {
+        instruction_set = kMips;
+      } else if (instruction_set_str == "x86") {
+        instruction_set = kX86;
+      } else if (instruction_set_str == "x86_64") {
+        instruction_set = kX86_64;
+      }
+    } else if (option.starts_with("--instruction-set-features=")) {
+      StringPiece str = option.substr(strlen("--instruction-set-features=")).data();
+      instruction_set_features = ParseFeatureList(str.as_string());
+    } else if (option.starts_with("--compiler-backend=")) {
+      StringPiece backend_str = option.substr(strlen("--compiler-backend=")).data();
+      if (backend_str == "Quick") {
+        compiler_kind = Compiler::kQuick;
+      } else if (backend_str == "Optimizing") {
+        compiler_kind = Compiler::kOptimizing;
+      } else if (backend_str == "Portable") {
+        compiler_kind = Compiler::kPortable;
+      }
+    } else if (option.starts_with("--compiler-filter=")) {
+      compiler_filter_string = option.substr(strlen("--compiler-filter=")).data();
+    } else if (option == "--compile-pic") {
       compile_pic = true;
     } else if (option.starts_with("--huge-method-max=")) {
       const char* threshold = option.substr(strlen("--huge-method-max=")).data();
@@ -1289,14 +1121,9 @@ static int dex2oat(int argc, char** argv) {
     Usage("--oat-symbols should not be used with --oat-fd");
   }
 
-    if (!image_ && boot_image_filename.empty()) {
-      boot_image_filename += android_root_;
-      boot_image_filename += "/framework/boot.art";
-    }
-    if (!boot_image_filename.empty()) {
-      boot_image_option_ += "-Ximage:";
-      boot_image_option_ += boot_image_filename;
-    }
+  if (!oat_symbols.empty() && is_host) {
+    Usage("--oat-symbols should not be used with --host");
+  }
 
   if (oat_fd != -1 && !image_filename.empty()) {
     Usage("--oat-fd should not be used with --image");
