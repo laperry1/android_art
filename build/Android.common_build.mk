@@ -99,6 +99,7 @@ endif
 ifeq ($(ART_USE_OPTIMIZING_COMPILER),true)
 DEX2OAT_FLAGS := --compiler-backend=Optimizing
 DALVIKVM_FLAGS += -Xcompiler-option --compiler-backend=Optimizing
+endif
 ifeq ($(WITH_ART_JIT), true)
 ART_JIT := true
 endif
