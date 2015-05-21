@@ -45,7 +45,7 @@ void Throwable::SetCause(Throwable* cause) {
   CHECK(cause != nullptr);
   CHECK(cause != this);
   Throwable* current_cause = GetFieldObject<Throwable>(OFFSET_OF_OBJECT_MEMBER(Throwable, cause_));
-  CHECK(current_cause == NULL || current_cause == this);
+  CHECK(current_cause == nullptr || current_cause == this);
   if (Runtime::Current()->IsActiveTransaction()) {
     SetFieldObject<true>(OFFSET_OF_OBJECT_MEMBER(Throwable, cause_), cause);
   } else {
@@ -69,11 +69,18 @@ bool Throwable::IsCheckedException() {
   return !InstanceOf(WellKnownClasses::ToClass(WellKnownClasses::java_lang_RuntimeException));
 }
 
+int32_t Throwable::GetStackDepth() {
+  Object* stack_state = GetStackState();
+  if (stack_state == nullptr || !stack_state->IsObjectArray()) return -1;
+  ObjectArray<Object>* method_trace = down_cast<ObjectArray<Object>*>(stack_state);
+  return method_trace->GetLength() - 1;
+}
+
 std::string Throwable::Dump() {
   std::string result(PrettyTypeOf(this));
   result += ": ";
   String* msg = GetDetailMessage();
-  if (msg != NULL) {
+  if (msg != nullptr) {
     result += msg->ToModifiedUtf8();
   }
   result += "\n";
@@ -132,7 +139,7 @@ std::string Throwable::Dump() {
 
 void Throwable::SetClass(Class* java_lang_Throwable) {
   CHECK(java_lang_Throwable_.IsNull());
-  CHECK(java_lang_Throwable != NULL);
+  CHECK(java_lang_Throwable != nullptr);
   java_lang_Throwable_ = GcRoot<Class>(java_lang_Throwable);
 }
 
@@ -141,8 +148,8 @@ void Throwable::ResetClass() {
   java_lang_Throwable_ = GcRoot<Class>(nullptr);
 }
 
-void Throwable::VisitRoots(RootCallback* callback, void* arg) {
-  java_lang_Throwable_.VisitRootIfNonNull(callback, arg, RootInfo(kRootStickyClass));
+void Throwable::VisitRoots(RootVisitor* visitor) {
+  java_lang_Throwable_.VisitRootIfNonNull(visitor, RootInfo(kRootStickyClass));
 }
 
 }  // namespace mirror

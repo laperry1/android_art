@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "java_lang_reflect_Method.h"
+
 #include "class_linker.h"
 #include "jni_internal.h"
 #include "mirror/art_method.h"
@@ -28,9 +30,9 @@
 namespace art {
 
 static jobject Method_invoke(JNIEnv* env, jobject javaMethod, jobject javaReceiver,
-                             jobject javaArgs, jboolean accessible) {
+                             jobject javaArgs) {
   ScopedFastNativeObjectAccess soa(env);
-  return InvokeMethod(soa, javaMethod, javaReceiver, javaArgs, (accessible == JNI_TRUE));
+  return InvokeMethod(soa, javaMethod, javaReceiver, javaArgs);
 }
 
 static jobject Method_getExceptionTypesNative(JNIEnv* env, jobject javaMethod) {
@@ -53,7 +55,7 @@ static jobject Method_getExceptionTypesNative(JNIEnv* env, jobject javaMethod) {
 }
 
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(Method, invoke, "!(Ljava/lang/Object;[Ljava/lang/Object;Z)Ljava/lang/Object;"),
+  NATIVE_METHOD(Method, invoke, "!(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"),
   NATIVE_METHOD(Method, getExceptionTypesNative, "!()[Ljava/lang/Class;"),
 };
 

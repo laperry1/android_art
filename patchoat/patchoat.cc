@@ -24,19 +24,18 @@
 #include <string>
 #include <vector>
 
+#include "art_field-inl.h"
+#include "base/dumpable.h"
 #include "base/scoped_flock.h"
 #include "base/stringpiece.h"
 #include "base/stringprintf.h"
+#include "base/unix_file/fd_file.h"
 #include "elf_utils.h"
 #include "elf_file.h"
+#include "elf_file_impl.h"
 #include "gc/space/image_space.h"
 #include "image.h"
-#include "instruction_set.h"
-#include "mirror/art_field.h"
-#include "mirror/art_field-inl.h"
-#include "mirror/art_method.h"
 #include "mirror/art_method-inl.h"
-#include "mirror/object.h"
 #include "mirror/object-inl.h"
 #include "mirror/reference.h"
 #include "noop_compiler_callbacks.h"
@@ -49,23 +48,6 @@
 #include "utils.h"
 
 namespace art {
-
-static InstructionSet ElfISAToInstructionSet(Elf32_Word isa) {
-  switch (isa) {
-    case EM_ARM:
-      return kArm;
-    case EM_AARCH64:
-      return kArm64;
-    case EM_386:
-      return kX86;
-    case EM_X86_64:
-      return kX86_64;
-    case EM_MIPS:
-      return kMips;
-    default:
-      return kNone;
-  }
-}
 
 static bool LocationToFilename(const std::string& location, InstructionSet isa,
                                std::string* filename) {
@@ -214,7 +196,7 @@ bool PatchOat::Patch(File* input_oat, const std::string& image_location, off_t d
       LOG(ERROR) << "unable to read elf header";
       return false;
     }
-    isa = ElfISAToInstructionSet(elf_hdr.e_machine);
+    isa = GetInstructionSetFromELF(elf_hdr.e_machine, elf_hdr.e_flags);
   }
   const char* isa_name = GetInstructionSetString(isa);
   std::string image_filename;
@@ -466,12 +448,63 @@ bool PatchOat::SymlinkOrCopy(File* input_oat,
   return true;
 }
 
+void PatchOat::PatchArtFields(const ImageHeader* image_header) {
+  const size_t art_field_size = image_header->GetArtFieldsSize();
+  const size_t art_field_offset = image_header->GetArtFieldsOffset();
+  for (size_t pos = 0; pos < art_field_size; pos += sizeof(ArtField)) {
+    auto* field = reinterpret_cast<ArtField*>(heap_->Begin() + art_field_offset + pos);
+    auto* dest_field = RelocatedCopyOf(field);
+    dest_field->SetDeclaringClass(RelocatedAddressOfPointer(field->GetDeclaringClass()));
+  }
+}
+
+void PatchOat::PatchDexFileArrays(mirror::ObjectArray<mirror::Object>* img_roots) {
+  auto* dex_caches = down_cast<mirror::ObjectArray<mirror::DexCache>*>(
+      img_roots->Get(ImageHeader::kDexCaches));
+  for (size_t i = 0, count = dex_caches->GetLength(); i < count; ++i) {
+    auto* dex_cache = dex_caches->GetWithoutChecks(i);
+    auto* fields = dex_cache->GetResolvedFields();
+    if (fields == nullptr) {
+      continue;
+    }
+    CHECK(!fields->IsObjectArray());
+    CHECK(fields->IsArrayInstance());
+    auto* component_type = fields->GetClass()->GetComponentType();
+    if (component_type->IsPrimitiveInt()) {
+      mirror::IntArray* arr = fields->AsIntArray();
+      mirror::IntArray* copy_arr = down_cast<mirror::IntArray*>(RelocatedCopyOf(arr));
+      for (size_t j = 0, count2 = arr->GetLength(); j < count2; ++j) {
+        auto f = arr->GetWithoutChecks(j);
+        if (f != 0) {
+          copy_arr->SetWithoutChecks<false>(j, f + delta_);
+        }
+      }
+    } else {
+      CHECK(component_type->IsPrimitiveLong());
+      mirror::LongArray* arr = fields->AsLongArray();
+      mirror::LongArray* copy_arr = down_cast<mirror::LongArray*>(RelocatedCopyOf(arr));
+      for (size_t j = 0, count2 = arr->GetLength(); j < count2; ++j) {
+        auto f = arr->GetWithoutChecks(j);
+        if (f != 0) {
+          copy_arr->SetWithoutChecks<false>(j, f + delta_);
+        }
+      }
+    }
+  }
+}
+
 bool PatchOat::PatchImage() {
   ImageHeader* image_header = reinterpret_cast<ImageHeader*>(image_->Begin());
   CHECK_GT(image_->Size(), sizeof(ImageHeader));
   // These are the roots from the original file.
-  mirror::Object* img_roots = image_header->GetImageRoots();
+  auto* img_roots = image_header->GetImageRoots();
   image_header->RelocateImage(delta_);
+
+  // Patch and update ArtFields.
+  PatchArtFields(image_header);
+
+  // Patch dex file int/long arrays which point to ArtFields.
+  PatchDexFileArrays(img_roots);
 
   VisitObject(img_roots);
   if (!image_header->IsValid()) {
@@ -496,42 +529,32 @@ bool PatchOat::InHeap(mirror::Object* o) {
 }
 
 void PatchOat::PatchVisitor::operator() (mirror::Object* obj, MemberOffset off,
-                                         bool is_static_unused) const {
+                                         bool is_static_unused ATTRIBUTE_UNUSED) const {
   mirror::Object* referent = obj->GetFieldObject<mirror::Object, kVerifyNone>(off);
   DCHECK(patcher_->InHeap(referent)) << "Referent is not in the heap.";
-  mirror::Object* moved_object = patcher_->RelocatedAddressOf(referent);
+  mirror::Object* moved_object = patcher_->RelocatedAddressOfPointer(referent);
   copy_->SetFieldObjectWithoutWriteBarrier<false, true, kVerifyNone>(off, moved_object);
 }
 
-void PatchOat::PatchVisitor::operator() (mirror::Class* cls, mirror::Reference* ref) const {
+void PatchOat::PatchVisitor::operator() (mirror::Class* cls ATTRIBUTE_UNUSED,
+                                         mirror::Reference* ref) const {
   MemberOffset off = mirror::Reference::ReferentOffset();
   mirror::Object* referent = ref->GetReferent();
   DCHECK(patcher_->InHeap(referent)) << "Referent is not in the heap.";
-  mirror::Object* moved_object = patcher_->RelocatedAddressOf(referent);
+  mirror::Object* moved_object = patcher_->RelocatedAddressOfPointer(referent);
   copy_->SetFieldObjectWithoutWriteBarrier<false, true, kVerifyNone>(off, moved_object);
 }
 
-mirror::Object* PatchOat::RelocatedCopyOf(mirror::Object* obj) {
-  if (obj == nullptr) {
-    return nullptr;
-  }
-  DCHECK_GT(reinterpret_cast<uintptr_t>(obj), reinterpret_cast<uintptr_t>(heap_->Begin()));
-  DCHECK_LT(reinterpret_cast<uintptr_t>(obj), reinterpret_cast<uintptr_t>(heap_->End()));
-  uintptr_t heap_off =
-      reinterpret_cast<uintptr_t>(obj) - reinterpret_cast<uintptr_t>(heap_->Begin());
-  DCHECK_LT(heap_off, image_->Size());
-  return reinterpret_cast<mirror::Object*>(image_->Begin() + heap_off);
-}
-
-mirror::Object* PatchOat::RelocatedAddressOf(mirror::Object* obj) {
-  if (obj == nullptr) {
-    return nullptr;
-  } else {
-    return reinterpret_cast<mirror::Object*>(reinterpret_cast<byte*>(obj) + delta_);
-  }
-}
-
 const OatHeader* PatchOat::GetOatHeader(const ElfFile* elf_file) {
+  if (elf_file->Is64Bit()) {
+    return GetOatHeader<ElfFileImpl64>(elf_file->GetImpl64());
+  } else {
+    return GetOatHeader<ElfFileImpl32>(elf_file->GetImpl32());
+  }
+}
+
+template <typename ElfFileImpl>
+const OatHeader* PatchOat::GetOatHeader(const ElfFileImpl* elf_file) {
   auto rodata_sec = elf_file->FindSectionByName(".rodata");
   if (rodata_sec == nullptr) {
     return nullptr;
@@ -548,7 +571,7 @@ void PatchOat::VisitObject(mirror::Object* object) {
   if (kUseBakerOrBrooksReadBarrier) {
     object->AssertReadBarrierPointer();
     if (kUseBrooksReadBarrier) {
-      mirror::Object* moved_to = RelocatedAddressOf(object);
+      mirror::Object* moved_to = RelocatedAddressOfPointer(object);
       copy->SetReadBarrierPointer(moved_to);
       DCHECK_EQ(copy->GetReadBarrierPointer(), moved_to);
     }
@@ -557,6 +580,12 @@ void PatchOat::VisitObject(mirror::Object* object) {
   object->VisitReferences<true, kVerifyNone>(visitor, visitor);
   if (object->IsArtMethod<kVerifyNone>()) {
     FixupMethod(down_cast<mirror::ArtMethod*>(object), down_cast<mirror::ArtMethod*>(copy));
+  } else if (object->IsClass<kVerifyNone>()) {
+    mirror::Class* klass = down_cast<mirror::Class*>(object);
+    down_cast<mirror::Class*>(copy)->SetSFieldsUnchecked(
+        RelocatedAddressOfPointer(klass->GetSFields()));
+    down_cast<mirror::Class*>(copy)->SetIFieldsUnchecked(
+        RelocatedAddressOfPointer(klass->GetIFields()));
   }
 }
 
@@ -564,14 +593,6 @@ void PatchOat::FixupMethod(mirror::ArtMethod* object, mirror::ArtMethod* copy) {
   const size_t pointer_size = InstructionSetPointerSize(isa_);
   // Just update the entry points if it looks like we should.
   // TODO: sanity check all the pointers' values
-#if defined(ART_USE_PORTABLE_COMPILER)
-  uintptr_t portable = reinterpret_cast<uintptr_t>(
-      object->GetEntryPointFromPortableCompiledCodePtrSize<kVerifyNone>(pointer_size));
-  if (portable != 0) {
-    copy->SetEntryPointFromPortableCompiledCodePtrSize(reinterpret_cast<void*>(portable + delta_),
-                                                       pointer_size);
-  }
-#endif
   uintptr_t quick= reinterpret_cast<uintptr_t>(
       object->GetEntryPointFromQuickCompiledCodePtrSize<kVerifyNone>(pointer_size));
   if (quick != 0) {
@@ -636,45 +657,15 @@ bool PatchOat::Patch(File* input_oat, off_t delta, File* output_oat, TimingLogge
   return true;
 }
 
-bool PatchOat::CheckOatFile() {
-  Elf32_Shdr* patches_sec = oat_file_->FindSectionByName(".oat_patches");
-  if (patches_sec == nullptr) {
-    return false;
-  }
-  if (patches_sec->sh_type != SHT_OAT_PATCH) {
-    return false;
-  }
-  uintptr_t* patches = reinterpret_cast<uintptr_t*>(oat_file_->Begin() + patches_sec->sh_offset);
-  uintptr_t* patches_end = patches + (patches_sec->sh_size/sizeof(uintptr_t));
-  Elf32_Shdr* oat_data_sec = oat_file_->FindSectionByName(".rodata");
-  Elf32_Shdr* oat_text_sec = oat_file_->FindSectionByName(".text");
-  if (oat_data_sec == nullptr) {
-    return false;
-  }
-  if (oat_text_sec == nullptr) {
-    return false;
-  }
-  if (oat_text_sec->sh_offset <= oat_data_sec->sh_offset) {
-    return false;
-  }
-
-  for (; patches < patches_end; patches++) {
-    if (oat_text_sec->sh_size <= *patches) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-bool PatchOat::PatchOatHeader() {
-  Elf32_Shdr *rodata_sec = oat_file_->FindSectionByName(".rodata");
+template <typename ElfFileImpl>
+bool PatchOat::PatchOatHeader(ElfFileImpl* oat_file) {
+  auto rodata_sec = oat_file->FindSectionByName(".rodata");
   if (rodata_sec == nullptr) {
     return false;
   }
-  OatHeader* oat_header = reinterpret_cast<OatHeader*>(oat_file_->Begin() + rodata_sec->sh_offset);
+  OatHeader* oat_header = reinterpret_cast<OatHeader*>(oat_file->Begin() + rodata_sec->sh_offset);
   if (!oat_header->IsValid()) {
-    LOG(ERROR) << "Elf file " << oat_file_->GetFile().GetPath() << " has an invalid oat header";
+    LOG(ERROR) << "Elf file " << oat_file->GetFile().GetPath() << " has an invalid oat header";
     return false;
   }
   oat_header->RelocateOat(delta_);
@@ -682,109 +673,67 @@ bool PatchOat::PatchOatHeader() {
 }
 
 bool PatchOat::PatchElf() {
+  if (oat_file_->Is64Bit())
+    return PatchElf<ElfFileImpl64>(oat_file_->GetImpl64());
+  else
+    return PatchElf<ElfFileImpl32>(oat_file_->GetImpl32());
+}
+
+template <typename ElfFileImpl>
+bool PatchOat::PatchElf(ElfFileImpl* oat_file) {
   TimingLogger::ScopedTiming t("Fixup Elf Text Section", timings_);
-  if (!PatchTextSection()) {
+
+  // Fix up absolute references to locations within the boot image.
+  if (!oat_file->ApplyOatPatchesTo(".text", delta_)) {
     return false;
   }
 
-  if (!PatchOatHeader()) {
+  // Update the OatHeader fields referencing the boot image.
+  if (!PatchOatHeader<ElfFileImpl>(oat_file)) {
     return false;
   }
 
-  bool need_fixup = false;
-  t.NewTiming("Fixup Elf Headers");
-  // Fixup Phdr's
-  for (unsigned int i = 0; i < oat_file_->GetProgramHeaderNum(); i++) {
-    Elf32_Phdr* hdr = oat_file_->GetProgramHeader(i);
-    CHECK(hdr != nullptr);
-    if (hdr->p_vaddr != 0 && hdr->p_vaddr != hdr->p_offset) {
-      need_fixup = true;
-      hdr->p_vaddr += delta_;
-    }
-    if (hdr->p_paddr != 0 && hdr->p_paddr != hdr->p_offset) {
-      need_fixup = true;
-      hdr->p_paddr += delta_;
+  bool need_boot_oat_fixup = true;
+  for (unsigned int i = 0; i < oat_file->GetProgramHeaderNum(); ++i) {
+    auto hdr = oat_file->GetProgramHeader(i);
+    if (hdr->p_type == PT_LOAD && hdr->p_vaddr == 0u) {
+      need_boot_oat_fixup = false;
+      break;
     }
   }
-  if (!need_fixup) {
-    // This was never passed through ElfFixup so all headers/symbols just have their offset as
-    // their addr. Therefore we do not need to update these parts.
+  if (!need_boot_oat_fixup) {
+    // This is an app oat file that can be loaded at an arbitrary address in memory.
+    // Boot image references were patched above and there's nothing else to do.
     return true;
   }
+
+  // This is a boot oat file that's loaded at a particular address and we need
+  // to patch all absolute addresses, starting with ELF program headers.
+
+  t.NewTiming("Fixup Elf Headers");
+  // Fixup Phdr's
+  oat_file->FixupProgramHeaders(delta_);
+
   t.NewTiming("Fixup Section Headers");
-  for (unsigned int i = 0; i < oat_file_->GetSectionHeaderNum(); i++) {
-    Elf32_Shdr* hdr = oat_file_->GetSectionHeader(i);
-    CHECK(hdr != nullptr);
-    if (hdr->sh_addr != 0) {
-      hdr->sh_addr += delta_;
-    }
-  }
+  // Fixup Shdr's
+  oat_file->FixupSectionHeaders(delta_);
 
   t.NewTiming("Fixup Dynamics");
-  for (Elf32_Word i = 0; i < oat_file_->GetDynamicNum(); i++) {
-    Elf32_Dyn& dyn = oat_file_->GetDynamic(i);
-    if (IsDynamicSectionPointer(dyn.d_tag, oat_file_->GetHeader().e_machine)) {
-      dyn.d_un.d_ptr += delta_;
-    }
-  }
+  oat_file->FixupDynamic(delta_);
 
   t.NewTiming("Fixup Elf Symbols");
   // Fixup dynsym
-  Elf32_Shdr* dynsym_sec = oat_file_->FindSectionByName(".dynsym");
-  CHECK(dynsym_sec != nullptr);
-  if (!PatchSymbols(dynsym_sec)) {
+  if (!oat_file->FixupSymbols(delta_, true)) {
     return false;
   }
-
   // Fixup symtab
-  Elf32_Shdr* symtab_sec = oat_file_->FindSectionByName(".symtab");
-  if (symtab_sec != nullptr) {
-    if (!PatchSymbols(symtab_sec)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-bool PatchOat::PatchSymbols(Elf32_Shdr* section) {
-  Elf32_Sym* syms = reinterpret_cast<Elf32_Sym*>(oat_file_->Begin() + section->sh_offset);
-  const Elf32_Sym* last_sym =
-      reinterpret_cast<Elf32_Sym*>(oat_file_->Begin() + section->sh_offset + section->sh_size);
-  CHECK_EQ(section->sh_size % sizeof(Elf32_Sym), 0u)
-      << "Symtab section size is not multiple of symbol size";
-  for (; syms < last_sym; syms++) {
-    uint8_t sttype = ELF32_ST_TYPE(syms->st_info);
-    Elf32_Word shndx = syms->st_shndx;
-    if (shndx != SHN_ABS && shndx != SHN_COMMON && shndx != SHN_UNDEF &&
-        (sttype == STT_FUNC || sttype == STT_OBJECT)) {
-      CHECK_NE(syms->st_value, 0u);
-      syms->st_value += delta_;
-    }
-  }
-  return true;
-}
-
-bool PatchOat::PatchTextSection() {
-  Elf32_Shdr* patches_sec = oat_file_->FindSectionByName(".oat_patches");
-  if (patches_sec == nullptr) {
-    LOG(ERROR) << ".oat_patches section not found. Aborting patch";
+  if (!oat_file->FixupSymbols(delta_, false)) {
     return false;
   }
-  DCHECK(CheckOatFile()) << "Oat file invalid";
-  CHECK_EQ(patches_sec->sh_type, SHT_OAT_PATCH) << "Unexpected type of .oat_patches";
-  uintptr_t* patches = reinterpret_cast<uintptr_t*>(oat_file_->Begin() + patches_sec->sh_offset);
-  uintptr_t* patches_end = patches + (patches_sec->sh_size/sizeof(uintptr_t));
-  Elf32_Shdr* oat_text_sec = oat_file_->FindSectionByName(".text");
-  CHECK(oat_text_sec != nullptr);
-  byte* to_patch = oat_file_->Begin() + oat_text_sec->sh_offset;
-  uintptr_t to_patch_end = reinterpret_cast<uintptr_t>(to_patch) + oat_text_sec->sh_size;
 
-  for (; patches < patches_end; patches++) {
-    CHECK_LT(*patches, oat_text_sec->sh_size) << "Bad Patch";
-    uint32_t* patch_loc = reinterpret_cast<uint32_t*>(to_patch + *patches);
-    CHECK_LT(reinterpret_cast<uintptr_t>(patch_loc), to_patch_end);
-    *patch_loc += delta_;
+  t.NewTiming("Fixup Debug Sections");
+  if (!oat_file->FixupDebugSections(delta_)) {
+    return false;
   }
 
   return true;
@@ -814,7 +763,7 @@ static void UsageError(const char* fmt, ...) {
   va_end(ap);
 }
 
-static void Usage(const char *fmt, ...) {
+NO_RETURN static void Usage(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   UsageErrorV(fmt, ap);
@@ -928,7 +877,7 @@ static File* CreateOrOpen(const char* name, bool* created) {
     if (f.get() != nullptr) {
       if (fchmod(f->Fd(), 0644) != 0) {
         PLOG(ERROR) << "Unable to make " << name << " world readable";
-        unlink(name);
+        TEMP_FAILURE_RETRY(unlink(name));
         return nullptr;
       }
     }
@@ -1061,7 +1010,7 @@ static int patchoat(int argc, char **argv) {
   bool dump_timings = kIsDebugBuild;
   bool lock_output = true;
 
-  for (int i = 0; i < argc; i++) {
+  for (int i = 0; i < argc; ++i) {
     const StringPiece option(argv[i]);
     const bool log_options = false;
     if (log_options) {
@@ -1368,6 +1317,9 @@ static int patchoat(int argc, char **argv) {
         input_oat_filename_dummy = true;
       }
       input_oat.reset(new File(input_oat_fd, input_oat_filename, false));
+      if (input_oat_fd == output_oat_fd) {
+        input_oat.get()->DisableAutoClose();
+      }
       if (input_oat == nullptr) {
         // Unlikely, but ensure exhaustive logging in non-0 exit code case
         LOG(ERROR) << "Failed to open input oat file by its FD" << input_oat_fd;
@@ -1409,11 +1361,11 @@ static int patchoat(int argc, char **argv) {
     if (!success) {
       if (new_oat_out) {
         CHECK(!output_oat_filename.empty());
-        unlink(output_oat_filename.c_str());
+        TEMP_FAILURE_RETRY(unlink(output_oat_filename.c_str()));
       }
       if (new_image_out) {
         CHECK(!output_image_filename.empty());
-        unlink(output_image_filename.c_str());
+        TEMP_FAILURE_RETRY(unlink(output_image_filename.c_str()));
       }
     }
     if (dump_timings) {

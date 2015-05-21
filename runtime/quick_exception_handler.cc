@@ -19,6 +19,7 @@
 #include "arch/context.h"
 #include "dex_instruction.h"
 #include "entrypoints/entrypoint_utils.h"
+#include "entrypoints/runtime_asm_entrypoints.h"
 #include "handle_scope-inl.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/class-inl.h"
@@ -45,7 +46,9 @@ class CatchBlockStackVisitor FINAL : public StackVisitor {
   CatchBlockStackVisitor(Thread* self, Context* context, Handle<mirror::Throwable>* exception,
                          QuickExceptionHandler* exception_handler)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      : StackVisitor(self, context), self_(self), exception_(exception),
+      : StackVisitor(self, context, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
+        self_(self),
+        exception_(exception),
         exception_handler_(exception_handler) {
   }
 
@@ -96,7 +99,7 @@ class CatchBlockStackVisitor FINAL : public StackVisitor {
       if (found_dex_pc != DexFile::kDexNoIndex) {
         exception_handler_->SetHandlerMethod(method.Get());
         exception_handler_->SetHandlerDexPc(found_dex_pc);
-        exception_handler_->SetHandlerQuickFramePc(method->ToNativePc(found_dex_pc));
+        exception_handler_->SetHandlerQuickFramePc(method->ToNativeQuickPc(found_dex_pc));
         exception_handler_->SetHandlerQuickFrame(GetCurrentQuickFrame());
         return false;  // End stack walk.
       }
@@ -113,9 +116,7 @@ class CatchBlockStackVisitor FINAL : public StackVisitor {
   DISALLOW_COPY_AND_ASSIGN(CatchBlockStackVisitor);
 };
 
-void QuickExceptionHandler::FindCatch(const ThrowLocation& throw_location,
-                                      mirror::Throwable* exception,
-                                      bool is_exception_reported) {
+void QuickExceptionHandler::FindCatch(mirror::Throwable* exception) {
   DCHECK(!is_deoptimization_);
   if (kDebugExceptionDelivery) {
     mirror::String* msg = exception->GetDetailMessage();
@@ -145,24 +146,14 @@ void QuickExceptionHandler::FindCatch(const ThrowLocation& throw_location,
     DCHECK(!self_->IsExceptionPending());
   } else {
     // Put exception back in root set with clear throw location.
-    self_->SetException(ThrowLocation(), exception_ref.Get());
-    self_->SetExceptionReportedToInstrumentation(is_exception_reported);
+    self_->SetException(exception_ref.Get());
   }
   // The debugger may suspend this thread and walk its stack. Let's do this before popping
   // instrumentation frames.
-  if (!is_exception_reported) {
-    instrumentation::Instrumentation* instrumentation = Runtime::Current()->GetInstrumentation();
-    instrumentation->ExceptionCaughtEvent(self_, throw_location, handler_method_, handler_dex_pc_,
-                                          exception_ref.Get());
-      // We're not catching this exception but let's remind we already reported the exception above
-      // to avoid reporting it twice.
-      self_->SetExceptionReportedToInstrumentation(true);
-  }
-  bool caught_exception = (handler_method_ != nullptr && handler_dex_pc_ != DexFile::kDexNoIndex);
-  if (caught_exception) {
-    // We're catching this exception so we finish reporting it. We do it here to avoid doing it
-    // in the compiled code.
-    self_->SetExceptionReportedToInstrumentation(false);
+  instrumentation::Instrumentation* instrumentation = Runtime::Current()->GetInstrumentation();
+  if (instrumentation->HasExceptionCaughtListeners()
+      && self_->IsExceptionThrownByCurrentMethod(exception)) {
+    instrumentation->ExceptionCaughtEvent(self_, exception_ref.Get());
   }
 }
 
@@ -171,7 +162,9 @@ class DeoptimizeStackVisitor FINAL : public StackVisitor {
  public:
   DeoptimizeStackVisitor(Thread* self, Context* context, QuickExceptionHandler* exception_handler)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      : StackVisitor(self, context), self_(self), exception_handler_(exception_handler),
+      : StackVisitor(self, context, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
+        self_(self),
+        exception_handler_(exception_handler),
         prev_shadow_frame_(nullptr) {
     CHECK(!self_->HasDeoptimizationShadowFrame());
   }
@@ -208,60 +201,109 @@ class DeoptimizeStackVisitor FINAL : public StackVisitor {
     Handle<mirror::DexCache> h_dex_cache(hs.NewHandle(declaring_class->GetDexCache()));
     Handle<mirror::ClassLoader> h_class_loader(hs.NewHandle(declaring_class->GetClassLoader()));
     Handle<mirror::ArtMethod> h_method(hs.NewHandle(m));
-    verifier::MethodVerifier verifier(h_dex_cache->GetDexFile(), &h_dex_cache, &h_class_loader,
-                                      &m->GetClassDef(), code_item, m->GetDexMethodIndex(), m,
-                                      m->GetAccessFlags(), true, true, true);
+    verifier::MethodVerifier verifier(self_, h_dex_cache->GetDexFile(), h_dex_cache, h_class_loader,
+                                      &m->GetClassDef(), code_item, m->GetDexMethodIndex(),
+                                      h_method, m->GetAccessFlags(), true, true, true, true);
     bool verifier_success = verifier.Verify();
     CHECK(verifier_success) << PrettyMethod(h_method.Get());
-    ShadowFrame* new_frame = ShadowFrame::Create(num_regs, nullptr, h_method.Get(), dex_pc);
+    ShadowFrame* new_frame = ShadowFrame::CreateDeoptimizedFrame(
+        num_regs, nullptr, h_method.Get(), dex_pc);
     self_->SetShadowFrameUnderConstruction(new_frame);
     const std::vector<int32_t> kinds(verifier.DescribeVRegs(dex_pc));
+
+    // Markers for dead values, used when the verifier knows a Dex register is undefined,
+    // or when the compiler knows the register has not been initialized, or is not used
+    // anymore in the method.
+    static constexpr uint32_t kDeadValue = 0xEBADDE09;
+    static constexpr uint64_t kLongDeadValue = 0xEBADDE09EBADDE09;
     for (uint16_t reg = 0; reg < num_regs; ++reg) {
       VRegKind kind = GetVRegKind(reg, kinds);
       switch (kind) {
         case kUndefined:
-          new_frame->SetVReg(reg, 0xEBADDE09);
+          new_frame->SetVReg(reg, kDeadValue);
           break;
         case kConstant:
           new_frame->SetVReg(reg, kinds.at((reg * 2) + 1));
           break;
-        case kReferenceVReg:
-          new_frame->SetVRegReference(reg,
-                                      reinterpret_cast<mirror::Object*>(GetVReg(h_method.Get(),
-                                                                                reg, kind)));
+        case kReferenceVReg: {
+          uint32_t value = 0;
+          // Check IsReferenceVReg in case the compiled GC map doesn't agree with the verifier.
+          // We don't want to copy a stale reference into the shadow frame as a reference.
+          // b/20736048
+          if (GetVReg(h_method.Get(), reg, kind, &value) && IsReferenceVReg(h_method.Get(), reg)) {
+            new_frame->SetVRegReference(reg, reinterpret_cast<mirror::Object*>(value));
+          } else {
+            new_frame->SetVReg(reg, kDeadValue);
+          }
           break;
+        }
         case kLongLoVReg:
           if (GetVRegKind(reg + 1, kinds) == kLongHiVReg) {
             // Treat it as a "long" register pair.
-            new_frame->SetVRegLong(reg, GetVRegPair(h_method.Get(), reg, kLongLoVReg, kLongHiVReg));
+            uint64_t value = 0;
+            if (GetVRegPair(h_method.Get(), reg, kLongLoVReg, kLongHiVReg, &value)) {
+              new_frame->SetVRegLong(reg, value);
+            } else {
+              new_frame->SetVRegLong(reg, kLongDeadValue);
+            }
           } else {
-            new_frame->SetVReg(reg, GetVReg(h_method.Get(), reg, kind));
+            uint32_t value = 0;
+            if (GetVReg(h_method.Get(), reg, kind, &value)) {
+              new_frame->SetVReg(reg, value);
+            } else {
+              new_frame->SetVReg(reg, kDeadValue);
+            }
           }
           break;
         case kLongHiVReg:
           if (GetVRegKind(reg - 1, kinds) == kLongLoVReg) {
             // Nothing to do: we treated it as a "long" register pair.
           } else {
-            new_frame->SetVReg(reg, GetVReg(h_method.Get(), reg, kind));
+            uint32_t value = 0;
+            if (GetVReg(h_method.Get(), reg, kind, &value)) {
+              new_frame->SetVReg(reg, value);
+            } else {
+              new_frame->SetVReg(reg, kDeadValue);
+            }
           }
           break;
         case kDoubleLoVReg:
           if (GetVRegKind(reg + 1, kinds) == kDoubleHiVReg) {
-            // Treat it as a "double" register pair.
-            new_frame->SetVRegLong(reg, GetVRegPair(h_method.Get(), reg, kDoubleLoVReg, kDoubleHiVReg));
+            uint64_t value = 0;
+            if (GetVRegPair(h_method.Get(), reg, kDoubleLoVReg, kDoubleHiVReg, &value)) {
+              // Treat it as a "double" register pair.
+              new_frame->SetVRegLong(reg, value);
+            } else {
+              new_frame->SetVRegLong(reg, kLongDeadValue);
+            }
           } else {
-            new_frame->SetVReg(reg, GetVReg(h_method.Get(), reg, kind));
+            uint32_t value = 0;
+            if (GetVReg(h_method.Get(), reg, kind, &value)) {
+              new_frame->SetVReg(reg, value);
+            } else {
+              new_frame->SetVReg(reg, kDeadValue);
+            }
           }
           break;
         case kDoubleHiVReg:
           if (GetVRegKind(reg - 1, kinds) == kDoubleLoVReg) {
             // Nothing to do: we treated it as a "double" register pair.
           } else {
-            new_frame->SetVReg(reg, GetVReg(h_method.Get(), reg, kind));
+            uint32_t value = 0;
+            if (GetVReg(h_method.Get(), reg, kind, &value)) {
+              new_frame->SetVReg(reg, value);
+            } else {
+              new_frame->SetVReg(reg, kDeadValue);
+            }
           }
           break;
         default:
-          new_frame->SetVReg(reg, GetVReg(h_method.Get(), reg, kind));
+          uint32_t value = 0;
+          if (GetVReg(h_method.Get(), reg, kind, &value)) {
+            new_frame->SetVReg(reg, value);
+          } else {
+            new_frame->SetVReg(reg, kDeadValue);
+          }
           break;
       }
     }
@@ -292,16 +334,16 @@ void QuickExceptionHandler::DeoptimizeStack() {
   visitor.WalkStack(true);
 
   // Restore deoptimization exception
-  self_->SetException(ThrowLocation(), Thread::GetDeoptimizationException());
+  self_->SetException(Thread::GetDeoptimizationException());
 }
 
 // Unwinds all instrumentation stack frame prior to catch handler or upcall.
 class InstrumentationStackVisitor : public StackVisitor {
  public:
-  InstrumentationStackVisitor(Thread* self, bool is_deoptimization, size_t frame_depth)
+  InstrumentationStackVisitor(Thread* self, size_t frame_depth)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      : StackVisitor(self, nullptr),
-        self_(self), frame_depth_(frame_depth),
+      : StackVisitor(self, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
+        frame_depth_(frame_depth),
         instrumentation_frames_to_pop_(0) {
     CHECK_NE(frame_depth_, kInvalidFrameDepth);
   }
@@ -310,8 +352,13 @@ class InstrumentationStackVisitor : public StackVisitor {
     size_t current_frame_depth = GetFrameDepth();
     if (current_frame_depth < frame_depth_) {
       CHECK(GetMethod() != nullptr);
-      if (UNLIKELY(GetQuickInstrumentationExitPc() == GetReturnPc())) {
-        ++instrumentation_frames_to_pop_;
+      if (UNLIKELY(reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc()) == GetReturnPc())) {
+        if (!IsInInlinedFrame()) {
+          // We do not count inlined frames, because we do not instrument them. The reason we
+          // include them in the stack walking is the check against `frame_depth_`, which is
+          // given to us by a visitor that visits inlined frames.
+          ++instrumentation_frames_to_pop_;
+        }
       }
       return true;
     } else {
@@ -325,7 +372,6 @@ class InstrumentationStackVisitor : public StackVisitor {
   }
 
  private:
-  Thread* const self_;
   const size_t frame_depth_;
   size_t instrumentation_frames_to_pop_;
 
@@ -334,7 +380,7 @@ class InstrumentationStackVisitor : public StackVisitor {
 
 void QuickExceptionHandler::UpdateInstrumentationStack() {
   if (method_tracing_active_) {
-    InstrumentationStackVisitor visitor(self_, is_deoptimization_, handler_frame_depth_);
+    InstrumentationStackVisitor visitor(self_, handler_frame_depth_);
     visitor.WalkStack(true);
 
     size_t instrumentation_frames_to_pop = visitor.GetInstrumentationFramesToPop();
@@ -353,6 +399,7 @@ void QuickExceptionHandler::DoLongJump() {
   context_->SetPC(handler_quick_frame_pc_);
   context_->SmashCallerSaves();
   context_->DoLongJump();
+  UNREACHABLE();
 }
 
 }  // namespace art

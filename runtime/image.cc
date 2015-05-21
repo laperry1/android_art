@@ -23,11 +23,13 @@
 
 namespace art {
 
-const byte ImageHeader::kImageMagic[] = { 'a', 'r', 't', '\n' };
-const byte ImageHeader::kImageVersion[] = { '0', '1', '2', '\0' };
+const uint8_t ImageHeader::kImageMagic[] = { 'a', 'r', 't', '\n' };
+const uint8_t ImageHeader::kImageVersion[] = { '0', '1', '5', '\0' };
 
 ImageHeader::ImageHeader(uint32_t image_begin,
                          uint32_t image_size,
+                         uint32_t art_fields_offset,
+                         uint32_t art_fields_size,
                          uint32_t image_bitmap_offset,
                          uint32_t image_bitmap_size,
                          uint32_t image_roots,
@@ -39,6 +41,8 @@ ImageHeader::ImageHeader(uint32_t image_begin,
                          bool compile_pic)
   : image_begin_(image_begin),
     image_size_(image_size),
+    art_fields_offset_(art_fields_offset),
+    art_fields_size_(art_fields_size),
     image_bitmap_offset_(image_bitmap_offset),
     image_bitmap_size_(image_bitmap_size),
     oat_checksum_(oat_checksum),
@@ -111,7 +115,17 @@ mirror::Object* ImageHeader::GetImageRoot(ImageRoot image_root) const {
 }
 
 mirror::ObjectArray<mirror::Object>* ImageHeader::GetImageRoots() const {
-  return reinterpret_cast<mirror::ObjectArray<mirror::Object>*>(image_roots_);
+  // Need a read barrier as it's not visited during root scan.
+  // Pass in the address of the local variable to the read barrier
+  // rather than image_roots_ because it won't move (asserted below)
+  // and it's a const member.
+  mirror::ObjectArray<mirror::Object>* image_roots =
+      reinterpret_cast<mirror::ObjectArray<mirror::Object>*>(image_roots_);
+  mirror::ObjectArray<mirror::Object>* result =
+      ReadBarrier::BarrierForRoot<mirror::ObjectArray<mirror::Object>, kWithReadBarrier, true>(
+          &image_roots);
+  DCHECK_EQ(image_roots, result);
+  return result;
 }
 
 }  // namespace art

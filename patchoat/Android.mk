@@ -42,4 +42,9 @@ ifeq ($(ART_BUILD_NDEBUG),true)
 endif
 ifeq ($(ART_BUILD_DEBUG),true)
   $(eval $(call build-art-executable,patchoat,$(PATCHOAT_SRC_FILES),,art/compiler,host,debug,,libz))
+ifeq ($(ART_BUILD_HOST_NDEBUG),true)
+  $(eval $(call build-art-executable,patchoat,$(PATCHOAT_SRC_FILES),libcutils,art/compiler,host,ndebug))
+endif
+ifeq ($(ART_BUILD_HOST_DEBUG),true)
+  $(eval $(call build-art-executable,patchoat,$(PATCHOAT_SRC_FILES),libcutils,art/compiler,host,debug))
 endif

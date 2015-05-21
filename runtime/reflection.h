@@ -17,32 +17,30 @@
 #ifndef ART_RUNTIME_REFLECTION_H_
 #define ART_RUNTIME_REFLECTION_H_
 
+#include "base/mutex.h"
 #include "jni.h"
 #include "primitive.h"
 
 namespace art {
 namespace mirror {
-  class ArtField;
   class ArtMethod;
   class Class;
   class Object;
 }  // namespace mirror
+class ArtField;
 union JValue;
-class MethodHelper;
 class ScopedObjectAccessAlreadyRunnable;
 class ShadowFrame;
-class ThrowLocation;
 
 mirror::Object* BoxPrimitive(Primitive::Type src_class, const JValue& value)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-bool UnboxPrimitiveForField(mirror::Object* o, mirror::Class* dst_class, mirror::ArtField* f,
+bool UnboxPrimitiveForField(mirror::Object* o, mirror::Class* dst_class, ArtField* f,
                             JValue* unboxed_value)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-bool UnboxPrimitiveForResult(const ThrowLocation& throw_location, mirror::Object* o,
-                             mirror::Class* dst_class, JValue* unboxed_value)
+bool UnboxPrimitiveForResult(mirror::Object* o, mirror::Class* dst_class, JValue* unboxed_value)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-ALWAYS_INLINE bool ConvertPrimitiveValue(const ThrowLocation* throw_location, bool unbox_for_result,
+ALWAYS_INLINE bool ConvertPrimitiveValue(bool unbox_for_result,
                                          Primitive::Type src_class, Primitive::Type dst_class,
                                          const JValue& src, JValue* dst)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -63,19 +61,28 @@ JValue InvokeVirtualOrInterfaceWithVarArgs(const ScopedObjectAccessAlreadyRunnab
                                            jobject obj, jmethodID mid, va_list args)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-void InvokeWithShadowFrame(Thread* self, ShadowFrame* shadow_frame, uint16_t arg_offset,
-                           MethodHelper& mh, JValue* result)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
+// num_frames is number of frames we look up for access check.
 jobject InvokeMethod(const ScopedObjectAccessAlreadyRunnable& soa, jobject method, jobject receiver,
-                     jobject args, bool accessible)
+                     jobject args, size_t num_frames = 1)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-bool VerifyObjectIsClass(mirror::Object* o, mirror::Class* c)
+ALWAYS_INLINE bool VerifyObjectIsClass(mirror::Object* o, mirror::Class* c)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
 bool VerifyAccess(Thread* self, mirror::Object* obj, mirror::Class* declaring_class,
-                  uint32_t access_flags)
+                  uint32_t access_flags, mirror::Class** calling_class, size_t num_frames)
+    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+// This version takes a known calling class.
+bool VerifyAccess(Thread* self, mirror::Object* obj, mirror::Class* declaring_class,
+                  uint32_t access_flags, mirror::Class* calling_class)
+    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+// Get the calling class by using a stack visitor, may return null for unattached native threads.
+mirror::Class* GetCallingClass(Thread* self, size_t num_frames)
+    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+void InvalidReceiverError(mirror::Object* o, mirror::Class* c)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
 }  // namespace art

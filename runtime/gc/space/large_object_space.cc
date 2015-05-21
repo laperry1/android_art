@@ -18,6 +18,7 @@
 
 #include <memory>
 
+#include "gc/accounting/heap_bitmap-inl.h"
 #include "gc/accounting/space_bitmap-inl.h"
 #include "base/logging.h"
 #include "base/mutex-inl.h"
@@ -37,15 +38,25 @@ class ValgrindLargeObjectMapSpace FINAL : public LargeObjectMapSpace {
   explicit ValgrindLargeObjectMapSpace(const std::string& name) : LargeObjectMapSpace(name) {
   }
 
+  ~ValgrindLargeObjectMapSpace() OVERRIDE {
+    // Keep valgrind happy if there is any large objects such as dex cache arrays which aren't
+    // freed since they are held live by the class linker.
+    MutexLock mu(Thread::Current(), lock_);
+    for (auto& m : mem_maps_) {
+      delete m.second;
+    }
+  }
+
   virtual mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated,
-                                size_t* usable_size) OVERRIDE {
+                                size_t* usable_size, size_t* bytes_tl_bulk_allocated)
+      OVERRIDE {
     mirror::Object* obj =
         LargeObjectMapSpace::Alloc(self, num_bytes + kValgrindRedZoneBytes * 2, bytes_allocated,
-                                   usable_size);
+                                   usable_size, bytes_tl_bulk_allocated);
     mirror::Object* object_without_rdz = reinterpret_cast<mirror::Object*>(
         reinterpret_cast<uintptr_t>(obj) + kValgrindRedZoneBytes);
     VALGRIND_MAKE_MEM_NOACCESS(reinterpret_cast<void*>(obj), kValgrindRedZoneBytes);
-    VALGRIND_MAKE_MEM_NOACCESS(reinterpret_cast<byte*>(object_without_rdz) + num_bytes,
+    VALGRIND_MAKE_MEM_NOACCESS(reinterpret_cast<uint8_t*>(object_without_rdz) + num_bytes,
                                kValgrindRedZoneBytes);
     if (usable_size != nullptr) {
       *usable_size = num_bytes;  // Since we have redzones, shrink the usable size.
@@ -84,7 +95,7 @@ void LargeObjectSpace::SwapBitmaps() {
   mark_bitmap_->SetName(temp_name);
 }
 
-LargeObjectSpace::LargeObjectSpace(const std::string& name, byte* begin, byte* end)
+LargeObjectSpace::LargeObjectSpace(const std::string& name, uint8_t* begin, uint8_t* end)
     : DiscontinuousSpace(name, kGcRetentionPolicyAlwaysCollect),
       num_bytes_allocated_(0), num_objects_allocated_(0), total_bytes_allocated_(0),
       total_objects_allocated_(0), begin_(begin), end_(end) {
@@ -108,22 +119,33 @@ LargeObjectMapSpace* LargeObjectMapSpace::Create(const std::string& name) {
 }
 
 mirror::Object* LargeObjectMapSpace::Alloc(Thread* self, size_t num_bytes,
-                                           size_t* bytes_allocated, size_t* usable_size) {
+                                           size_t* bytes_allocated, size_t* usable_size,
+                                           size_t* bytes_tl_bulk_allocated) {
   std::string error_msg;
-  MemMap* mem_map = MemMap::MapAnonymous("large object space allocation", NULL, num_bytes,
-                                         PROT_READ | PROT_WRITE, true, &error_msg);
-  if (UNLIKELY(mem_map == NULL)) {
+  MemMap* mem_map = MemMap::MapAnonymous("large object space allocation", nullptr, num_bytes,
+                                         PROT_READ | PROT_WRITE, true, false, &error_msg);
+  if (UNLIKELY(mem_map == nullptr)) {
     LOG(WARNING) << "Large object allocation failed: " << error_msg;
-    return NULL;
+    return nullptr;
+  }
+  mirror::Object* const obj = reinterpret_cast<mirror::Object*>(mem_map->Begin());
+  if (kIsDebugBuild) {
+    ReaderMutexLock mu2(Thread::Current(), *Locks::heap_bitmap_lock_);
+    auto* heap = Runtime::Current()->GetHeap();
+    auto* live_bitmap = heap->GetLiveBitmap();
+    auto* space_bitmap = live_bitmap->GetContinuousSpaceBitmap(obj);
+    CHECK(space_bitmap == nullptr) << obj << " overlaps with bitmap " << *space_bitmap;
+    auto* obj_end = reinterpret_cast<mirror::Object*>(mem_map->End());
+    space_bitmap = live_bitmap->GetContinuousSpaceBitmap(obj_end - 1);
+    CHECK(space_bitmap == nullptr) << obj_end << " overlaps with bitmap " << *space_bitmap;
   }
   MutexLock mu(self, lock_);
-  mirror::Object* obj = reinterpret_cast<mirror::Object*>(mem_map->Begin());
   large_objects_.push_back(obj);
   mem_maps_.Put(obj, mem_map);
-  size_t allocation_size = mem_map->Size();
+  const size_t allocation_size = mem_map->BaseSize();
   DCHECK(bytes_allocated != nullptr);
-  begin_ = std::min(begin_, reinterpret_cast<byte*>(obj));
-  byte* obj_end = reinterpret_cast<byte*>(obj) + allocation_size;
+  begin_ = std::min(begin_, reinterpret_cast<uint8_t*>(obj));
+  uint8_t* obj_end = reinterpret_cast<uint8_t*>(obj) + allocation_size;
   if (end_ == nullptr || obj_end > end_) {
     end_ = obj_end;
   }
@@ -131,6 +153,8 @@ mirror::Object* LargeObjectMapSpace::Alloc(Thread* self, size_t num_bytes,
   if (usable_size != nullptr) {
     *usable_size = allocation_size;
   }
+  DCHECK(bytes_tl_bulk_allocated != nullptr);
+  *bytes_tl_bulk_allocated = allocation_size;
   num_bytes_allocated_ += allocation_size;
   total_bytes_allocated_ += allocation_size;
   ++num_objects_allocated_;
@@ -145,8 +169,9 @@ size_t LargeObjectMapSpace::Free(Thread* self, mirror::Object* ptr) {
     Runtime::Current()->GetHeap()->DumpSpaces(LOG(ERROR));
     LOG(FATAL) << "Attempted to free large object " << ptr << " which was not live";
   }
-  DCHECK_GE(num_bytes_allocated_, found->second->Size());
-  size_t allocation_size = found->second->Size();
+  const size_t map_size = found->second->BaseSize();
+  DCHECK_GE(num_bytes_allocated_, map_size);
+  size_t allocation_size = map_size;
   num_bytes_allocated_ -= allocation_size;
   --num_objects_allocated_;
   delete found->second;
@@ -158,7 +183,11 @@ size_t LargeObjectMapSpace::AllocationSize(mirror::Object* obj, size_t* usable_s
   MutexLock mu(Thread::Current(), lock_);
   auto found = mem_maps_.find(obj);
   CHECK(found != mem_maps_.end()) << "Attempted to get size of a large object which is not live";
-  return found->second->Size();
+  size_t alloc_size = found->second->BaseSize();
+  if (usable_size != nullptr) {
+    *usable_size = alloc_size;
+  }
+  return alloc_size;
 }
 
 size_t LargeObjectSpace::FreeList(Thread* self, size_t num_ptrs, mirror::Object** ptrs) {
@@ -177,7 +206,7 @@ void LargeObjectMapSpace::Walk(DlMallocSpace::WalkCallback callback, void* arg) 
   for (auto it = mem_maps_.begin(); it != mem_maps_.end(); ++it) {
     MemMap* mem_map = it->second;
     callback(mem_map->Begin(), mem_map->End(), mem_map->Size(), arg);
-    callback(NULL, NULL, 0, arg);
+    callback(nullptr, nullptr, 0, arg);
   }
 }
 
@@ -282,16 +311,16 @@ inline bool FreeListSpace::SortByPrevFree::operator()(const AllocationInfo* a,
   return reinterpret_cast<uintptr_t>(a) < reinterpret_cast<uintptr_t>(b);
 }
 
-FreeListSpace* FreeListSpace::Create(const std::string& name, byte* requested_begin, size_t size) {
+FreeListSpace* FreeListSpace::Create(const std::string& name, uint8_t* requested_begin, size_t size) {
   CHECK_EQ(size % kAlignment, 0U);
   std::string error_msg;
   MemMap* mem_map = MemMap::MapAnonymous(name.c_str(), requested_begin, size,
-                                         PROT_READ | PROT_WRITE, true, &error_msg);
-  CHECK(mem_map != NULL) << "Failed to allocate large object space mem map: " << error_msg;
+                                         PROT_READ | PROT_WRITE, true, false, &error_msg);
+  CHECK(mem_map != nullptr) << "Failed to allocate large object space mem map: " << error_msg;
   return new FreeListSpace(name, mem_map, mem_map->Begin(), mem_map->End());
 }
 
-FreeListSpace::FreeListSpace(const std::string& name, MemMap* mem_map, byte* begin, byte* end)
+FreeListSpace::FreeListSpace(const std::string& name, MemMap* mem_map, uint8_t* begin, uint8_t* end)
     : LargeObjectSpace(name, begin, end),
       mem_map_(mem_map),
       lock_("free list space lock", kAllocSpaceLock) {
@@ -300,9 +329,10 @@ FreeListSpace::FreeListSpace(const std::string& name, MemMap* mem_map, byte* beg
   CHECK_ALIGNED(space_capacity, kAlignment);
   const size_t alloc_info_size = sizeof(AllocationInfo) * (space_capacity / kAlignment);
   std::string error_msg;
-  allocation_info_map_.reset(MemMap::MapAnonymous("large object free list space allocation info map",
-                                                  nullptr, alloc_info_size, PROT_READ | PROT_WRITE,
-                                                  false, &error_msg));
+  allocation_info_map_.reset(
+      MemMap::MapAnonymous("large object free list space allocation info map",
+                           nullptr, alloc_info_size, PROT_READ | PROT_WRITE,
+                           false, false, &error_msg));
   CHECK(allocation_info_map_.get() != nullptr) << "Failed to allocate allocation info map"
       << error_msg;
   allocation_info_ = reinterpret_cast<AllocationInfo*>(allocation_info_map_->Begin());
@@ -318,8 +348,8 @@ void FreeListSpace::Walk(DlMallocSpace::WalkCallback callback, void* arg) {
   while (cur_info < end_info) {
     if (!cur_info->IsFree()) {
       size_t alloc_size = cur_info->ByteSize();
-      byte* byte_start = reinterpret_cast<byte*>(GetAddressForAllocationInfo(cur_info));
-      byte* byte_end = byte_start + alloc_size;
+      uint8_t* byte_start = reinterpret_cast<uint8_t*>(GetAddressForAllocationInfo(cur_info));
+      uint8_t* byte_end = byte_start + alloc_size;
       callback(byte_start, byte_end, alloc_size, arg);
       callback(nullptr, nullptr, 0, arg);
     }
@@ -407,7 +437,7 @@ size_t FreeListSpace::AllocationSize(mirror::Object* obj, size_t* usable_size) {
 }
 
 mirror::Object* FreeListSpace::Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated,
-                                     size_t* usable_size) {
+                                     size_t* usable_size, size_t* bytes_tl_bulk_allocated) {
   MutexLock mu(self, lock_);
   const size_t allocation_size = RoundUp(num_bytes, kAlignment);
   AllocationInfo temp_info;
@@ -445,6 +475,8 @@ mirror::Object* FreeListSpace::Alloc(Thread* self, size_t num_bytes, size_t* byt
   if (usable_size != nullptr) {
     *usable_size = allocation_size;
   }
+  DCHECK(bytes_tl_bulk_allocated != nullptr);
+  *bytes_tl_bulk_allocated = allocation_size;
   // Need to do these inside of the lock.
   ++num_objects_allocated_;
   ++total_objects_allocated_;

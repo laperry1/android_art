@@ -17,6 +17,7 @@
 #ifndef ART_RUNTIME_CLASS_LINKER_H_
 #define ART_RUNTIME_CLASS_LINKER_H_
 
+#include <deque>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,7 +28,6 @@
 #include "base/mutex.h"
 #include "dex_file.h"
 #include "gc_root.h"
-#include "gtest/gtest.h"
 #include "jni.h"
 #include "oat_file.h"
 #include "object_callbacks.h"
@@ -48,6 +48,7 @@ namespace mirror {
   class StackTraceElement;
 }  // namespace mirror
 
+template<class T> class Handle;
 class InternTable;
 template<class T> class ObjectLock;
 class Runtime;
@@ -60,11 +61,55 @@ enum VisitRootFlags : uint8_t;
 
 class ClassLinker {
  public:
+  // Well known mirror::Class roots accessed via GetClassRoot.
+  enum ClassRoot {
+    kJavaLangClass,
+    kJavaLangObject,
+    kClassArrayClass,
+    kObjectArrayClass,
+    kJavaLangString,
+    kJavaLangDexCache,
+    kJavaLangRefReference,
+    kJavaLangReflectArtMethod,
+    kJavaLangReflectConstructor,
+    kJavaLangReflectField,
+    kJavaLangReflectMethod,
+    kJavaLangReflectProxy,
+    kJavaLangStringArrayClass,
+    kJavaLangReflectArtMethodArrayClass,
+    kJavaLangReflectConstructorArrayClass,
+    kJavaLangReflectFieldArrayClass,
+    kJavaLangReflectMethodArrayClass,
+    kJavaLangClassLoader,
+    kJavaLangThrowable,
+    kJavaLangClassNotFoundException,
+    kJavaLangStackTraceElement,
+    kPrimitiveBoolean,
+    kPrimitiveByte,
+    kPrimitiveChar,
+    kPrimitiveDouble,
+    kPrimitiveFloat,
+    kPrimitiveInt,
+    kPrimitiveLong,
+    kPrimitiveShort,
+    kPrimitiveVoid,
+    kBooleanArrayClass,
+    kByteArrayClass,
+    kCharArrayClass,
+    kDoubleArrayClass,
+    kFloatArrayClass,
+    kIntArrayClass,
+    kLongArrayClass,
+    kShortArrayClass,
+    kJavaLangStackTraceElementArrayClass,
+    kClassRootsMax,
+  };
+
   explicit ClassLinker(InternTable* intern_table);
   ~ClassLinker();
 
   // Initialize class linker by bootstraping from dex files.
-  void InitWithoutImage(const std::vector<const DexFile*>& boot_class_path)
+  void InitWithoutImage(std::vector<std::unique_ptr<const DexFile>> boot_class_path)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Initialize class linker from one or more images.
@@ -76,11 +121,15 @@ class ClassLinker {
                            Handle<mirror::ClassLoader> class_loader)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  // Find a class in the path class loader, loading it if necessary. Hash function is supposed to
-  // be ComputeModifiedUtf8Hash(descriptor).
-  mirror::Class* FindClassInPathClassLoader(ScopedObjectAccessAlreadyRunnable& soa,
-                                            Thread* self, const char* descriptor, size_t hash,
-                                            Handle<mirror::ClassLoader> class_loader)
+  // Finds a class in the path class loader, loading it if necessary without using JNI. Hash
+  // function is supposed to be ComputeModifiedUtf8Hash(descriptor). Returns true if the
+  // class-loader chain could be handled, false otherwise, i.e., a non-supported class-loader
+  // was encountered while walking the parent chain (currently only BootClassLoader and
+  // PathClassLoader are supported).
+  bool FindClassInPathClassLoader(ScopedObjectAccessAlreadyRunnable& soa,
+                                  Thread* self, const char* descriptor, size_t hash,
+                                  Handle<mirror::ClassLoader> class_loader,
+                                  mirror::Class** result)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Finds a class by its descriptor using the "system" class loader, ie by searching the
@@ -93,7 +142,9 @@ class ClassLinker {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Returns true if the class linker is initialized.
-  bool IsInitialized() const;
+  bool IsInitialized() const {
+    return init_done_;
+  }
 
   // Define a new a class based on a ClassDef from a DexFile
   mirror::Class* DefineClass(Thread* self, const char* descriptor, size_t hash,
@@ -101,9 +152,9 @@ class ClassLinker {
                              const DexFile& dex_file, const DexFile::ClassDef& dex_class_def)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  // Finds a class by its descriptor, returning NULL if it isn't wasn't loaded
+  // Finds a class by its descriptor, returning null if it isn't wasn't loaded
   // by the given 'class_loader'.
-  mirror::Class* LookupClass(const char* descriptor, size_t hash,
+  mirror::Class* LookupClass(Thread* self, const char* descriptor, size_t hash,
                              mirror::ClassLoader* class_loader)
       LOCKS_EXCLUDED(Locks::classlinker_classes_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -126,8 +177,7 @@ class ClassLinker {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   void DumpForSigQuit(std::ostream& os)
-      LOCKS_EXCLUDED(Locks::classlinker_classes_lock_)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      LOCKS_EXCLUDED(Locks::classlinker_classes_lock_);
 
   size_t NumLoadedClasses()
       LOCKS_EXCLUDED(Locks::classlinker_classes_lock_)
@@ -157,7 +207,7 @@ class ClassLinker {
   mirror::Class* ResolveType(uint16_t type_idx, mirror::ArtMethod* referrer)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  mirror::Class* ResolveType(uint16_t type_idx, mirror::ArtField* referrer)
+  mirror::Class* ResolveType(uint16_t type_idx, ArtField* referrer)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Resolve a type with the given ID from the DexFile, storing the
@@ -182,17 +232,17 @@ class ClassLinker {
                                    InvokeType type)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  mirror::ArtMethod* GetResolvedMethod(uint32_t method_idx, mirror::ArtMethod* referrer,
-                                       InvokeType type)
+  mirror::ArtMethod* GetResolvedMethod(uint32_t method_idx, mirror::ArtMethod* referrer)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   mirror::ArtMethod* ResolveMethod(Thread* self, uint32_t method_idx, mirror::ArtMethod** referrer,
                                    InvokeType type)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  mirror::ArtField* GetResolvedField(uint32_t field_idx, mirror::Class* field_declaring_class)
+  ArtField* GetResolvedField(uint32_t field_idx, mirror::Class* field_declaring_class)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  mirror::ArtField* ResolveField(uint32_t field_idx, mirror::ArtMethod* referrer,
-                                 bool is_static)
+  ArtField* GetResolvedField(uint32_t field_idx, mirror::DexCache* dex_cache)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  ArtField* ResolveField(uint32_t field_idx, mirror::ArtMethod* referrer, bool is_static)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Resolve a field with a given ID from the DexFile, storing the
@@ -200,7 +250,7 @@ class ClassLinker {
   // in ResolveType. What is unique is the is_static argument which is
   // used to determine if we are resolving a static or non-static
   // field.
-  mirror::ArtField* ResolveField(const DexFile& dex_file,
+  ArtField* ResolveField(const DexFile& dex_file,
                                  uint32_t field_idx,
                                  Handle<mirror::DexCache> dex_cache,
                                  Handle<mirror::ClassLoader> class_loader,
@@ -211,7 +261,7 @@ class ClassLinker {
   // result in DexCache. The ClassLinker and ClassLoader are used as
   // in ResolveType. No is_static argument is provided so that Java
   // field resolution semantics are followed.
-  mirror::ArtField* ResolveFieldJLS(const DexFile& dex_file, uint32_t field_idx,
+  ArtField* ResolveFieldJLS(const DexFile& dex_file, uint32_t field_idx,
                                     Handle<mirror::DexCache> dex_cache,
                                     Handle<mirror::ClassLoader> class_loader)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -223,7 +273,8 @@ class ClassLinker {
   // Returns true on success, false if there's an exception pending.
   // can_run_clinit=false allows the compiler to attempt to init a class,
   // given the restriction that no <clinit> execution is possible.
-  bool EnsureInitialized(Handle<mirror::Class> c, bool can_init_fields, bool can_init_parents)
+  bool EnsureInitialized(Thread* self, Handle<mirror::Class> c, bool can_init_fields,
+                         bool can_init_parents)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Initializes classes that have instances in the image but that have
@@ -244,6 +295,10 @@ class ClassLinker {
     return boot_class_path_;
   }
 
+  // Returns the first non-image oat file in the class path.
+  const OatFile* GetPrimaryOatFile()
+      LOCKS_EXCLUDED(dex_lock_);
+
   void VisitClasses(ClassVisitor* visitor, void* arg)
       LOCKS_EXCLUDED(Locks::classlinker_classes_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -255,10 +310,10 @@ class ClassLinker {
   void VisitClassesWithoutClassesLock(ClassVisitor* visitor, void* arg)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void VisitClassRoots(RootCallback* callback, void* arg, VisitRootFlags flags)
+  void VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags)
       LOCKS_EXCLUDED(Locks::classlinker_classes_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void VisitRoots(RootCallback* callback, void* arg, VisitRootFlags flags)
+  void VisitRoots(RootVisitor* visitor, VisitRootFlags flags)
       LOCKS_EXCLUDED(dex_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
@@ -271,32 +326,27 @@ class ClassLinker {
       LOCKS_EXCLUDED(dex_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  // Generate an oat file from a dex file
-  bool GenerateOatFile(const char* dex_filename,
-                       int oat_fd,
-                       const char* oat_cache_filename,
-                       std::string* error_msg)
-      LOCKS_EXCLUDED(Locks::mutator_lock_);
-
-  // Find or create the oat file holding dex_location. Then load all corresponding dex files
-  // (if multidex) into the given vector.
-  bool OpenDexFilesFromOat(const char* dex_location, const char* oat_location,
-                           std::vector<std::string>* error_msgs,
-                           std::vector<const DexFile*>* dex_files)
+  // Finds or creates the oat file holding dex_location. Then loads and returns
+  // all corresponding dex files (there may be more than one dex file loaded
+  // in the case of multidex).
+  // This may return the original, unquickened dex files if the oat file could
+  // not be generated.
+  //
+  // Returns an empty vector if the dex files could not be loaded. In this
+  // case, there will be at least one error message returned describing why no
+  // dex files could not be loaded. The 'error_msgs' argument must not be
+  // null, regardless of whether there is an error or not.
+  //
+  // This method should not be called with the mutator_lock_ held, because it
+  // could end up starving GC if we need to generate or relocate any oat
+  // files.
+  std::vector<std::unique_ptr<const DexFile>>  OpenDexFilesFromOat(
+      const char* dex_location, const char* oat_location,
+      std::vector<std::string>* error_msgs)
       LOCKS_EXCLUDED(dex_lock_, Locks::mutator_lock_);
 
-  // Returns true if the given oat file has the same image checksum as the image it is paired with.
-  static bool VerifyOatImageChecksum(const OatFile* oat_file, const InstructionSet instruction_set);
-  // Returns true if the oat file checksums match with the image and the offsets are such that it
-  // could be loaded with it.
-  static bool VerifyOatChecksums(const OatFile* oat_file, const InstructionSet instruction_set,
-                                 std::string* error_msg);
-  // Returns true if oat file contains the dex file with the given location and checksum.
-  static bool VerifyOatAndDexFileChecksums(const OatFile* oat_file,
-                                           const char* dex_location,
-                                           uint32_t dex_location_checksum,
-                                           InstructionSet instruction_set,
-                                           std::string* error_msg);
+  // Allocate an instance of a java.lang.Object.
+  mirror::Object* AllocObject(Thread* self) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // TODO: replace this with multiple methods that allocate the correct managed type.
   template <class T>
@@ -315,14 +365,15 @@ class ClassLinker {
   mirror::IfTable* AllocIfTable(Thread* self, size_t ifcount)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  mirror::ObjectArray<mirror::ArtField>* AllocArtFieldArray(Thread* self, size_t length)
+  ArtField* AllocArtFieldArray(Thread* self, size_t length)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   mirror::ObjectArray<mirror::StackTraceElement>* AllocStackTraceElementArray(Thread* self,
                                                                               size_t length)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void VerifyClass(Handle<mirror::Class> klass) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void VerifyClass(Thread* self, Handle<mirror::Class> klass)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   bool VerifyClassUsingOatFile(const DexFile& dex_file, mirror::Class* klass,
                                mirror::Class::Status& oat_file_class_status)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -346,18 +397,10 @@ class ClassLinker {
   // Get the oat code for a method when its class isn't yet initialized
   const void* GetQuickOatCodeFor(mirror::ArtMethod* method)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-#if defined(ART_USE_PORTABLE_COMPILER)
-  const void* GetPortableOatCodeFor(mirror::ArtMethod* method, bool* have_portable_code)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-#endif
 
   // Get the oat code for a method from a method index.
   const void* GetQuickOatCodeFor(const DexFile& dex_file, uint16_t class_def_idx, uint32_t method_idx)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-#if defined(ART_USE_PORTABLE_COMPILER)
-  const void* GetPortableOatCodeFor(const DexFile& dex_file, uint16_t class_def_idx, uint32_t method_idx)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-#endif
 
   // Get compiled code for a method, return null if no code
   // exists. This is unlike Get..OatCodeFor which will return a bridge
@@ -368,35 +411,32 @@ class ClassLinker {
   pid_t GetClassesLockOwner();  // For SignalCatcher.
   pid_t GetDexLockOwner();  // For SignalCatcher.
 
-  const void* GetPortableResolutionTrampoline() const {
-    return portable_resolution_trampoline_;
-  }
+  mirror::Class* GetClassRoot(ClassRoot class_root) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  const void* GetQuickGenericJniTrampoline() const {
-    return quick_generic_jni_trampoline_;
-  }
+  static const char* GetClassRootDescriptor(ClassRoot class_root);
 
-  const void* GetQuickResolutionTrampoline() const {
-    return quick_resolution_trampoline_;
-  }
+  // Is the given entry point quick code to run the resolution stub?
+  bool IsQuickResolutionStub(const void* entry_point) const;
 
-  const void* GetPortableImtConflictTrampoline() const {
-    return portable_imt_conflict_trampoline_;
-  }
+  // Is the given entry point quick code to bridge into the interpreter?
+  bool IsQuickToInterpreterBridge(const void* entry_point) const;
 
-  const void* GetQuickImtConflictTrampoline() const {
-    return quick_imt_conflict_trampoline_;
-  }
-
-  const void* GetQuickToInterpreterBridgeTrampoline() const {
-    return quick_to_interpreter_bridge_trampoline_;
-  }
+  // Is the given entry point quick code to run the generic JNI stub?
+  bool IsQuickGenericJniStub(const void* entry_point) const;
 
   InternTable* GetInternTable() const {
     return intern_table_;
   }
 
-  // Attempts to insert a class into a class table.  Returns NULL if
+  // Set the entrypoints up for method to the given code.
+  void SetEntryPointsToCompiledCode(mirror::ArtMethod* method, const void* method_code) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  // Set the entrypoints up for method to the enter the interpreter.
+  void SetEntryPointsToInterpreter(mirror::ArtMethod* method) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  // Attempts to insert a class into a class table.  Returns null if
   // the class was inserted, otherwise returns an existing class with
   // the same descriptor and ClassLoader.
   mirror::Class* InsertClass(const char* descriptor, mirror::Class* klass, size_t hash)
@@ -408,7 +448,7 @@ class ClassLinker {
 
   mirror::ObjectArray<mirror::Class>* GetClassRoots() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     mirror::ObjectArray<mirror::Class>* class_roots = class_roots_.Read();
-    DCHECK(class_roots != NULL);
+    DCHECK(class_roots != nullptr);
     return class_roots;
   }
 
@@ -427,8 +467,16 @@ class ClassLinker {
   bool MayBeCalledWithDirectCodePointer(mirror::ArtMethod* m)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+  // Creates a GlobalRef PathClassLoader that can be used to load classes from the given dex files.
+  // Note: the objects are not completely set up. Do not use this outside of tests and the compiler.
+  jobject CreatePathClassLoader(Thread* self, std::vector<const DexFile*>& dex_files)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
  private:
-  bool FindOatMethodFor(mirror::ArtMethod* method, OatFile::OatMethod* oat_method)
+  static void InitFromImageInterpretOnlyCallback(mirror::Object* obj, void* arg)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  const OatFile::OatMethod FindOatMethodFor(mirror::ArtMethod* method, bool* found)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   OatFile& GetImageOatFile(gc::space::ImageSpace* space)
@@ -448,7 +496,6 @@ class ClassLinker {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   mirror::DexCache* AllocDexCache(Thread* self, const DexFile& dex_file)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  mirror::ArtField* AllocArtField(Thread* self) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   mirror::Class* CreatePrimitiveClass(Thread* self, Primitive::Type type)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -460,13 +507,9 @@ class ClassLinker {
                                   Handle<mirror::ClassLoader> class_loader)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void AppendToBootClassPath(const DexFile& dex_file)
+  void AppendToBootClassPath(Thread* self, const DexFile& dex_file)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   void AppendToBootClassPath(const DexFile& dex_file, Handle<mirror::DexCache> dex_cache)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  void ConstructFieldMap(const DexFile& dex_file, const DexFile::ClassDef& dex_class_def,
-                         mirror::Class* c, SafeMap<uint32_t, mirror::ArtField*>& field_map)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Precomputes size needed for Class, in the case of a non-temporary class this size must be
@@ -474,20 +517,21 @@ class ClassLinker {
   uint32_t SizeOfClassWithoutEmbeddedTables(const DexFile& dex_file,
                                             const DexFile::ClassDef& dex_class_def);
 
-  void LoadClass(const DexFile& dex_file,
-                 const DexFile::ClassDef& dex_class_def,
-                 Handle<mirror::Class> klass,
-                 mirror::ClassLoader* class_loader)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void LoadClassMembers(const DexFile& dex_file,
-                        const byte* class_data,
-                        Handle<mirror::Class> klass,
-                        mirror::ClassLoader* class_loader,
-                        const OatFile::OatClass* oat_class)
+  // Setup the classloader, class def index, type idx so that we can insert this class in the class
+  // table.
+  void SetupClass(const DexFile& dex_file, const DexFile::ClassDef& dex_class_def,
+                  Handle<mirror::Class> klass, mirror::ClassLoader* class_loader)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void LoadField(const DexFile& dex_file, const ClassDataItemIterator& it,
-                 Handle<mirror::Class> klass, Handle<mirror::ArtField> dst)
+  void LoadClass(Thread* self, const DexFile& dex_file, const DexFile::ClassDef& dex_class_def,
+                 Handle<mirror::Class> klass)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void LoadClassMembers(Thread* self, const DexFile& dex_file, const uint8_t* class_data,
+                        Handle<mirror::Class> klass, const OatFile::OatClass* oat_class)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  void LoadField(const ClassDataItemIterator& it, Handle<mirror::Class> klass,
+                 ArtField* dst)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   mirror::ArtMethod* LoadMethod(Thread* self, const DexFile& dex_file,
@@ -497,9 +541,9 @@ class ClassLinker {
 
   void FixupStaticTrampolines(mirror::Class* klass) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  // Finds the associated oat class for a dex_file and descriptor. Returns whether the class
-  // was found, and sets the data in oat_class.
-  bool FindOatClass(const DexFile& dex_file, uint16_t class_def_idx, OatFile::OatClass* oat_class)
+  // Finds the associated oat class for a dex_file and descriptor. Returns an invalid OatClass on
+  // error and sets found to false.
+  OatFile::OatClass FindOatClass(const DexFile& dex_file, uint16_t class_def_idx, bool* found)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   void RegisterDexFileLocked(const DexFile& dex_file, Handle<mirror::DexCache> dex_cache)
@@ -508,7 +552,7 @@ class ClassLinker {
   bool IsDexFileRegisteredLocked(const DexFile& dex_file)
       SHARED_LOCKS_REQUIRED(dex_lock_, Locks::mutator_lock_);
 
-  bool InitializeClass(Handle<mirror::Class> klass, bool can_run_clinit,
+  bool InitializeClass(Thread* self, Handle<mirror::Class> klass, bool can_run_clinit,
                        bool can_init_parents)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   bool WaitForInitializeClass(Handle<mirror::Class> klass, Thread* self,
@@ -550,22 +594,16 @@ class ClassLinker {
                             StackHandleScope<mirror::Class::kImtSize>* out_imt)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  bool LinkStaticFields(Handle<mirror::Class> klass, size_t* class_size)
+  bool LinkStaticFields(Thread* self, Handle<mirror::Class> klass, size_t* class_size)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  bool LinkInstanceFields(Handle<mirror::Class> klass)
+  bool LinkInstanceFields(Thread* self, Handle<mirror::Class> klass)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  bool LinkFields(Handle<mirror::Class> klass, bool is_static, size_t* class_size)
+  bool LinkFields(Thread* self, Handle<mirror::Class> klass, bool is_static, size_t* class_size)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   void LinkCode(Handle<mirror::ArtMethod> method, const OatFile::OatClass* oat_class,
-                const DexFile& dex_file, uint32_t dex_method_index, uint32_t method_index)
+                uint32_t class_def_method_index)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
   void CreateReferenceInstanceOffsets(Handle<mirror::Class> klass)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void CreateReferenceStaticOffsets(Handle<mirror::Class> klass)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void CreateReferenceOffsets(Handle<mirror::Class> klass, bool is_static,
-                              uint32_t reference_offsets)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // For use by ImageWriter to find DexCaches for its roots
@@ -578,83 +616,11 @@ class ClassLinker {
   }
   mirror::DexCache* GetDexCache(size_t idx) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_, dex_lock_);
 
-  const OatFile::OatDexFile* FindOpenedOatDexFileForDexFile(const DexFile& dex_file)
-      LOCKS_EXCLUDED(dex_lock_)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  // Find an opened oat dex file that contains dex_location. If oat_location is not nullptr,
-  // the file must have that location, else any oat location is accepted.
-  const OatFile::OatDexFile* FindOpenedOatDexFile(const char* oat_location,
-                                                  const char* dex_location,
-                                                  const uint32_t* dex_location_checksum)
-      LOCKS_EXCLUDED(dex_lock_);
-
-  // Will open the oat file directly without relocating, even if we could/should do relocation.
-  const OatFile* FindOatFileFromOatLocation(const std::string& oat_location,
-                                            std::string* error_msg)
-      LOCKS_EXCLUDED(dex_lock_);
-
   const OatFile* FindOpenedOatFileFromOatLocation(const std::string& oat_location)
       LOCKS_EXCLUDED(dex_lock_);
 
-  const OatFile* OpenOatFileFromDexLocation(const std::string& dex_location,
-                                            InstructionSet isa,
-                                            bool* already_opened,
-                                            bool* obsolete_file_cleanup_failed,
-                                            std::vector<std::string>* error_msg)
-      LOCKS_EXCLUDED(dex_lock_, Locks::mutator_lock_);
-
-  const OatFile* GetInterpretedOnlyOat(const std::string& oat_path,
-                                       InstructionSet isa,
-                                       std::string* error_msg);
-
-  const OatFile* PatchAndRetrieveOat(const std::string& input, const std::string& output,
-                                     const std::string& image_location, InstructionSet isa,
-                                     std::string* error_msg)
-      LOCKS_EXCLUDED(Locks::mutator_lock_);
-
-  bool CheckOatFile(const Runtime* runtime, const OatFile* oat_file, InstructionSet isa,
-                    bool* checksum_verified, std::string* error_msg);
-
-  // Note: will not register the oat file.
-  const OatFile* FindOatFileInOatLocationForDexFile(const char* dex_location,
-                                                    uint32_t dex_location_checksum,
-                                                    const char* oat_location,
-                                                    std::string* error_msg)
-      LOCKS_EXCLUDED(dex_lock_);
-
-  // Creates the oat file from the dex_location to the oat_location. Needs a file descriptor for
-  // the file to be written, which is assumed to be under a lock.
-  const OatFile* CreateOatFileForDexLocation(const char* dex_location,
-                                             int fd, const char* oat_location,
-                                             std::vector<std::string>* error_msgs)
-      LOCKS_EXCLUDED(dex_lock_, Locks::mutator_lock_);
-
-  // Finds an OatFile that contains a DexFile for the given a DexFile location.
-  //
-  // Note 1: this will not check open oat files, which are assumed to be stale when this is run.
-  // Note 2: Does not register the oat file. It is the caller's job to register if the file is to
-  //         be kept.
-  const OatFile* FindOatFileContainingDexFileFromDexLocation(const char* dex_location,
-                                                             const uint32_t* dex_location_checksum,
-                                                             InstructionSet isa,
-                                                             std::vector<std::string>* error_msgs,
-                                                             bool* obsolete_file_cleanup_failed)
-      LOCKS_EXCLUDED(dex_lock_, Locks::mutator_lock_);
-
-  // Verifies:
-  //  - that the oat file contains the dex file (with a matching checksum, which may be null if the
-  // file was pre-opted)
-  //  - the checksums of the oat file (against the image space)
-  //  - the checksum of the dex file against dex_location_checksum
-  //  - that the dex file can be opened
-  // Returns true iff all verification succeed.
-  //
-  // The dex_location is the dex location as stored in the oat file header.
-  // (see DexFile::GetDexCanonicalLocation for a description of location conventions)
-  bool VerifyOatWithDexFile(const OatFile* oat_file, const char* dex_location,
-                            const uint32_t* dex_location_checksum,
-                            std::string* error_msg);
+  // Returns the boot image oat file.
+  const OatFile* GetBootOatFile() SHARED_LOCKS_REQUIRED(dex_lock_);
 
   mirror::ArtMethod* CreateProxyConstructor(Thread* self, Handle<mirror::Class> klass,
                                             mirror::Class* proxy_class)
@@ -692,10 +658,26 @@ class ClassLinker {
   void FixupTemporaryDeclaringClass(mirror::Class* temp_class, mirror::Class* new_class)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+  void SetClassRoot(ClassRoot class_root, mirror::Class* klass)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  // Return the quick generic JNI stub for testing.
+  const void* GetRuntimeQuickGenericJniStub() const;
+
+  // Throw the class initialization failure recorded when first trying to initialize the given
+  // class.
+  // Note: Currently we only store the descriptor, so we cannot throw the exact throwable, only
+  //       a recreation with a custom string.
+  void ThrowEarlierClassFailure(mirror::Class* c) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  // Check for duplicate class definitions of the given oat file against all open oat files.
+  bool HasCollisions(const OatFile* oat_file, std::string* error_msg) LOCKS_EXCLUDED(dex_lock_);
+
   std::vector<const DexFile*> boot_class_path_;
+  std::vector<std::unique_ptr<const DexFile>> opened_dex_files_;
 
   mutable ReaderWriterMutex dex_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
-  std::vector<size_t> new_dex_cache_roots_ GUARDED_BY(dex_lock_);;
+  std::vector<size_t> new_dex_cache_roots_ GUARDED_BY(dex_lock_);
   std::vector<GcRoot<mirror::DexCache>> dex_caches_ GUARDED_BY(dex_lock_);
   std::vector<const OatFile*> oat_files_ GUARDED_BY(dex_lock_);
 
@@ -703,16 +685,16 @@ class ClassLinker {
    public:
     // Same class loader and descriptor.
     std::size_t operator()(const GcRoot<mirror::Class>& root) const NO_THREAD_SAFETY_ANALYSIS;
-    bool operator()(const GcRoot<mirror::Class>& a, const GcRoot<mirror::Class>& b)
+    bool operator()(const GcRoot<mirror::Class>& a, const GcRoot<mirror::Class>& b) const
         NO_THREAD_SAFETY_ANALYSIS;
     // Same class loader and descriptor.
     std::size_t operator()(const std::pair<const char*, mirror::ClassLoader*>& element) const
         NO_THREAD_SAFETY_ANALYSIS;
     bool operator()(const GcRoot<mirror::Class>& a,
-                    const std::pair<const char*, mirror::ClassLoader*>& b)
+                    const std::pair<const char*, mirror::ClassLoader*>& b) const
         NO_THREAD_SAFETY_ANALYSIS;
     // Same descriptor.
-    bool operator()(const GcRoot<mirror::Class>& a, const char* descriptor)
+    bool operator()(const GcRoot<mirror::Class>& a, const char* descriptor) const
         NO_THREAD_SAFETY_ANALYSIS;
     std::size_t operator()(const char* descriptor) const NO_THREAD_SAFETY_ANALYSIS;
   };
@@ -743,61 +725,8 @@ class ClassLinker {
   // the classes into the class_table_ to avoid dex cache based searches.
   Atomic<uint32_t> failed_dex_cache_class_lookups_;
 
-  // indexes into class_roots_.
-  // needs to be kept in sync with class_roots_descriptors_.
-  enum ClassRoot {
-    kJavaLangClass,
-    kJavaLangObject,
-    kClassArrayClass,
-    kObjectArrayClass,
-    kJavaLangString,
-    kJavaLangDexCache,
-    kJavaLangRefReference,
-    kJavaLangReflectArtField,
-    kJavaLangReflectArtMethod,
-    kJavaLangReflectProxy,
-    kJavaLangStringArrayClass,
-    kJavaLangReflectArtFieldArrayClass,
-    kJavaLangReflectArtMethodArrayClass,
-    kJavaLangClassLoader,
-    kJavaLangThrowable,
-    kJavaLangClassNotFoundException,
-    kJavaLangStackTraceElement,
-    kPrimitiveBoolean,
-    kPrimitiveByte,
-    kPrimitiveChar,
-    kPrimitiveDouble,
-    kPrimitiveFloat,
-    kPrimitiveInt,
-    kPrimitiveLong,
-    kPrimitiveShort,
-    kPrimitiveVoid,
-    kBooleanArrayClass,
-    kByteArrayClass,
-    kCharArrayClass,
-    kDoubleArrayClass,
-    kFloatArrayClass,
-    kIntArrayClass,
-    kLongArrayClass,
-    kShortArrayClass,
-    kJavaLangStackTraceElementArrayClass,
-    kClassRootsMax,
-  };
+  // Well known mirror::Class roots.
   GcRoot<mirror::ObjectArray<mirror::Class>> class_roots_;
-
-  ALWAYS_INLINE mirror::Class* GetClassRoot(ClassRoot class_root)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  void SetClassRoot(ClassRoot class_root, mirror::Class* klass)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  static const char* class_roots_descriptors_[];
-
-  const char* GetClassRootDescriptor(ClassRoot class_root) {
-    const char* descriptor = class_roots_descriptors_[class_root];
-    CHECK(descriptor != NULL);
-    return descriptor;
-  }
 
   // The interface table used by all arrays.
   GcRoot<mirror::IfTable> array_iftable_;
@@ -816,9 +745,7 @@ class ClassLinker {
 
   // Trampolines within the image the bounce to runtime entrypoints. Done so that there is a single
   // patch point within the image. TODO: make these proper relocations.
-  const void* portable_resolution_trampoline_;
   const void* quick_resolution_trampoline_;
-  const void* portable_imt_conflict_trampoline_;
   const void* quick_imt_conflict_trampoline_;
   const void* quick_generic_jni_trampoline_;
   const void* quick_to_interpreter_bridge_trampoline_;
@@ -828,13 +755,9 @@ class ClassLinker {
 
   friend class ImageWriter;  // for GetClassRoots
   friend class ImageDumper;  // for FindOpenedOatFileFromOatLocation
-  friend class ElfPatcher;  // for FindOpenedOatFileForDexFile & FindOpenedOatFileFromOatLocation
-  friend class NoDex2OatTest;  // for FindOpenedOatFileForDexFile
-  friend class NoPatchoatTest;  // for FindOpenedOatFileForDexFile
-  FRIEND_TEST(ClassLinkerTest, ClassRootDescriptors);
-  FRIEND_TEST(mirror::DexCacheTest, Open);
-  FRIEND_TEST(ExceptionTest, FindExceptionHandler);
-  FRIEND_TEST(ObjectTest, AllocObjectArray);
+  friend class JniCompilerTest;  // for GetRuntimeQuickGenericJniStub
+  ART_FRIEND_TEST(mirror::DexCacheTest, Open);  // for AllocDexCache
+
   DISALLOW_COPY_AND_ASSIGN(ClassLinker);
 };
 

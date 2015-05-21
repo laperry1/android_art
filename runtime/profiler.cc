@@ -16,9 +16,11 @@
 
 #include "profiler.h"
 
-#include <fstream>
-#include <sys/uio.h>
 #include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+
+#include <fstream>
 
 #include "base/stl_util.h"
 #include "base/unix_file/fd_file.h"
@@ -38,13 +40,7 @@
 #include "thread.h"
 #include "thread_list.h"
 
-#ifdef HAVE_ANDROID_OS
-#include "cutils/properties.h"
-#endif
-
-#if !defined(ART_USE_PORTABLE_COMPILER)
 #include "entrypoints/quick/quick_entrypoints.h"
-#endif
 
 namespace art {
 
@@ -62,8 +58,10 @@ class BoundedStackVisitor : public StackVisitor {
   BoundedStackVisitor(std::vector<std::pair<mirror::ArtMethod*, uint32_t>>* stack,
       Thread* thread, uint32_t max_depth)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      : StackVisitor(thread, NULL), stack_(stack), max_depth_(max_depth), depth_(0) {
-  }
+      : StackVisitor(thread, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
+        stack_(stack),
+        max_depth_(max_depth),
+        depth_(0) {}
 
   bool VisitFrame() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     mirror::ArtMethod* m = GetMethod();
@@ -95,7 +93,7 @@ static void GetSample(Thread* thread, void* arg) SHARED_LOCKS_REQUIRED(Locks::mu
   switch (profile_options.GetProfileType()) {
     case kProfilerMethod: {
       mirror::ArtMethod* method = thread->GetCurrentMethod(nullptr);
-      if (false && method == nullptr) {
+      if ((false) && method == nullptr) {
         LOG(INFO) << "No current method available";
         std::ostringstream os;
         thread->Dump(os);
@@ -119,12 +117,12 @@ static void GetSample(Thread* thread, void* arg) SHARED_LOCKS_REQUIRED(Locks::mu
 }
 
 // A closure that is called by the thread checkpoint code.
-class SampleCheckpoint : public Closure {
+class SampleCheckpoint FINAL : public Closure {
  public:
   explicit SampleCheckpoint(BackgroundMethodSamplingProfiler* const profiler) :
     profiler_(profiler) {}
 
-  virtual void Run(Thread* thread) NO_THREAD_SAFETY_ANALYSIS {
+  void Run(Thread* thread) OVERRIDE {
     Thread* self = Thread::Current();
     if (thread == nullptr) {
       LOG(ERROR) << "Checkpoint with nullptr thread";
@@ -165,7 +163,7 @@ void* BackgroundMethodSamplingProfiler::RunProfilerThread(void* arg) {
 
 
   CHECK(runtime->AttachCurrentThread("Profiler", true, runtime->GetSystemThreadGroup(),
-                                      !runtime->IsCompiler()));
+                                      !runtime->IsAotCompiler()));
 
   Thread* self = Thread::Current();
 
@@ -192,6 +190,7 @@ void* BackgroundMethodSamplingProfiler::RunProfilerThread(void* arg) {
       VLOG(profiler) << "Delaying profile start for " << delay_secs << " secs";
       MutexLock mu(self, profiler->wait_lock_);
       profiler->period_condition_.TimedWait(self, delay_secs * 1000, 0);
+      // We were either signaled by Stop or timedout, in either case ignore the timed out result.
 
       // Expand the backoff by its coefficient, but don't go beyond the max.
       backoff = std::min(backoff * profiler->options_.GetBackoffCoefficient(), kMaxBackoffSecs);
@@ -238,17 +237,13 @@ void* BackgroundMethodSamplingProfiler::RunProfilerThread(void* arg) {
       // is done with a timeout so that we can detect problems with the checkpoint
       // running code.  We should never see this.
       const uint32_t kWaitTimeoutMs = 10000;
-      const uint32_t kWaitTimeoutUs = kWaitTimeoutMs * 1000;
 
-      uint64_t waitstart_us = MicroTime();
       // Wait for all threads to pass the barrier.
-      profiler->profiler_barrier_->Increment(self, barrier_count, kWaitTimeoutMs);
-      uint64_t waitend_us = MicroTime();
-      uint64_t waitdiff_us = waitend_us - waitstart_us;
+      bool timed_out =  profiler->profiler_barrier_->Increment(self, barrier_count, kWaitTimeoutMs);
 
       // We should never get a timeout.  If we do, it suggests a problem with the checkpoint
       // code.  Crash the process in this case.
-      CHECK_LT(waitdiff_us, kWaitTimeoutUs);
+      CHECK(!timed_out);
 
       // Update the current time.
       now_us = MicroTime();
@@ -307,7 +302,9 @@ uint32_t BackgroundMethodSamplingProfiler::WriteProfile() {
   } while (length > 0);
 
   // Truncate the file to the new length.
-  ftruncate(fd, full_length);
+  if (ftruncate(fd, full_length) == -1) {
+    LOG(ERROR) << "Failed to truncate profile file " << full_name;
+  }
 
   // Now unlock the file, allowing another process in.
   err = flock(fd, LOCK_UN);
@@ -406,7 +403,7 @@ BackgroundMethodSamplingProfiler::BackgroundMethodSamplingProfiler(
 bool BackgroundMethodSamplingProfiler::ProcessMethod(mirror::ArtMethod* method) {
   if (method == nullptr) {
     profile_table_.NullMethod();
-    // Don't record a nullptr method.
+    // Don't record a null method.
     return false;
   }
 
@@ -745,7 +742,7 @@ void ProfileSampleResults::ReadPrevious(int fd, ProfileDataType type) {
     return;
   }
   std::vector<std::string> summary_info;
-  Split(line, '/', summary_info);
+  Split(line, '/', &summary_info);
   if (summary_info.size() != 3) {
     // Bad summary info.  It should be count/nullcount/bootcount
     return;
@@ -760,7 +757,7 @@ void ProfileSampleResults::ReadPrevious(int fd, ProfileDataType type) {
       break;
     }
     std::vector<std::string> info;
-    Split(line, '/', info);
+    Split(line, '/', &info);
     if (info.size() != 3 && info.size() != 4) {
       // Malformed.
       break;
@@ -773,10 +770,10 @@ void ProfileSampleResults::ReadPrevious(int fd, ProfileDataType type) {
       context_map = new PreviousContextMap();
       std::string context_counts_str = info[3].substr(1, info[3].size() - 2);
       std::vector<std::string> context_count_pairs;
-      Split(context_counts_str, '#', context_count_pairs);
+      Split(context_counts_str, '#', &context_count_pairs);
       for (uint32_t i = 0; i < context_count_pairs.size(); ++i) {
         std::vector<std::string> context_count;
-        Split(context_count_pairs[i], ':', context_count);
+        Split(context_count_pairs[i], ':', &context_count);
         if (context_count.size() == 2) {
           // Handles the situtation when the profile file doesn't contain context information.
           uint32_t dexpc = strtoul(context_count[0].c_str(), nullptr, 10);
@@ -822,12 +819,12 @@ bool ProfileFile::LoadFile(const std::string& fileName) {
     return false;
   }
   std::vector<std::string> summary_info;
-  Split(line, '/', summary_info);
+  Split(line, '/', &summary_info);
   if (summary_info.size() != 3) {
     // Bad summary info.  It should be total/null/boot.
     return false;
   }
-  // This is the number of hits in all profiled methods (without nullptr or boot methods)
+  // This is the number of hits in all profiled methods (without null or boot methods)
   uint32_t total_count = strtoul(summary_info[0].c_str(), nullptr, 10);
 
   // Now read each line until the end of file.  Each line consists of 3 fields separated by '/'.
@@ -840,7 +837,7 @@ bool ProfileFile::LoadFile(const std::string& fileName) {
       break;
     }
     std::vector<std::string> info;
-    Split(line, '/', info);
+    Split(line, '/', &info);
     if (info.size() != 3 && info.size() != 4) {
       // Malformed.
       return false;

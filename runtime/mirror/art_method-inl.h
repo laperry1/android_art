@@ -21,11 +21,10 @@
 
 #include "art_field.h"
 #include "class.h"
-#include "class_linker.h"
+#include "class_linker-inl.h"
 #include "dex_cache.h"
 #include "dex_file.h"
-#include "entrypoints/entrypoint_utils.h"
-#include "method_helper.h"
+#include "dex_file-inl.h"
 #include "object-inl.h"
 #include "object_array.h"
 #include "oat.h"
@@ -37,8 +36,8 @@ namespace art {
 namespace mirror {
 
 inline uint32_t ArtMethod::ClassSize() {
-  uint32_t vtable_entries = Object::kVTableLength + 8;
-  return Class::ComputeClassSize(true, vtable_entries, 0, 0, 0);
+  uint32_t vtable_entries = Object::kVTableLength;
+  return Class::ComputeClassSize(true, vtable_entries, 0, 0, 0, 0, 0);
 }
 
 template<ReadBarrierOption kReadBarrierOption>
@@ -49,7 +48,7 @@ inline Class* ArtMethod::GetJavaLangReflectArtMethod() {
 
 inline Class* ArtMethod::GetDeclaringClass() {
   Class* result = GetFieldObject<Class>(OFFSET_OF_OBJECT_MEMBER(ArtMethod, declaring_class_));
-  DCHECK(result != NULL) << this;
+  DCHECK(result != nullptr) << this;
   DCHECK(result->IsIdxLoaded() || result->IsErroneous()) << this;
   return result;
 }
@@ -74,12 +73,7 @@ inline uint16_t ArtMethod::GetMethodIndexDuringLinking() {
 }
 
 inline uint32_t ArtMethod::GetDexMethodIndex() {
-#ifdef ART_SEA_IR_MODE
-  // TODO: Re-add this check for (PORTABLE + SMALL + ) SEA IR when PORTABLE IS fixed!
-  // DCHECK(GetDeclaringClass()->IsLoaded() || GetDeclaringClass()->IsErroneous());
-#else
   DCHECK(GetDeclaringClass()->IsLoaded() || GetDeclaringClass()->IsErroneous());
-#endif
   return GetField32(OFFSET_OF_OBJECT_MEMBER(ArtMethod, dex_method_index_));
 }
 
@@ -142,9 +136,21 @@ inline bool ArtMethod::HasSameDexCacheResolvedTypes(ArtMethod* other) {
   return GetDexCacheResolvedTypes() == other->GetDexCacheResolvedTypes();
 }
 
+inline mirror::Class* ArtMethod::GetClassFromTypeIndex(uint16_t type_idx, bool resolve) {
+  mirror::Class* type = GetDexCacheResolvedType(type_idx);
+  if (type == nullptr && resolve) {
+    type = Runtime::Current()->GetClassLinker()->ResolveType(type_idx, this);
+    CHECK(type != nullptr || Thread::Current()->IsExceptionPending());
+  }
+  return type;
+}
+
 inline uint32_t ArtMethod::GetCodeSize() {
   DCHECK(!IsRuntimeMethod() && !IsProxyMethod()) << PrettyMethod(this);
-  const void* code = EntryPointToCodePointer(GetEntryPointFromQuickCompiledCode());
+  return GetCodeSize(EntryPointToCodePointer(GetEntryPointFromQuickCompiledCode()));
+}
+
+inline uint32_t ArtMethod::GetCodeSize(const void* code) {
   if (code == nullptr) {
     return 0u;
   }
@@ -171,34 +177,8 @@ inline bool ArtMethod::CheckIncompatibleClassChange(InvokeType type) {
     }
     default:
       LOG(FATAL) << "Unreachable - invocation type: " << type;
-      return true;
+      UNREACHABLE();
   }
-}
-
-inline void ArtMethod::AssertPcIsWithinQuickCode(uintptr_t pc) {
-  if (!kIsDebugBuild) {
-    return;
-  }
-  if (IsNative() || IsRuntimeMethod() || IsProxyMethod()) {
-    return;
-  }
-  if (pc == GetQuickInstrumentationExitPc()) {
-    return;
-  }
-  const void* code = GetEntryPointFromQuickCompiledCode();
-  if (code == GetQuickToInterpreterBridge() || code == GetQuickInstrumentationEntryPoint()) {
-    return;
-  }
-  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  if (code == class_linker->GetQuickResolutionTrampoline() ||
-      code == class_linker->GetQuickToInterpreterBridgeTrampoline()) {
-    return;
-  }
-  DCHECK(IsWithinQuickCode(pc))
-      << PrettyMethod(this)
-      << " pc=" << std::hex << pc
-      << " code=" << code
-      << " size=" << GetCodeSize();
 }
 
 inline uint32_t ArtMethod::GetQuickOatCodeOffset() {
@@ -206,45 +186,9 @@ inline uint32_t ArtMethod::GetQuickOatCodeOffset() {
   return PointerToLowMemUInt32(GetEntryPointFromQuickCompiledCode());
 }
 
-
-#if defined(ART_USE_PORTABLE_COMPILER)
-inline uint32_t ArtMethod::GetPortableOatCodeOffset() {
-  DCHECK(!Runtime::Current()->IsStarted());
-  return PointerToLowMemUInt32(GetEntryPointFromPortableCompiledCode());
-}
-#endif
-
 inline void ArtMethod::SetQuickOatCodeOffset(uint32_t code_offset) {
   DCHECK(!Runtime::Current()->IsStarted());
   SetEntryPointFromQuickCompiledCode(reinterpret_cast<void*>(code_offset));
-}
-
-#if defined(ART_USE_PORTABLE_COMPILER)
-inline void ArtMethod::SetPortableOatCodeOffset(uint32_t code_offset) {
-  DCHECK(!Runtime::Current()->IsStarted());
-  SetEntryPointFromPortableCompiledCode(reinterpret_cast<void*>(code_offset));
-}
-#endif
-
-inline const void* ArtMethod::GetQuickOatEntryPoint(size_t pointer_size) {
-  if (IsPortableCompiled() || IsAbstract() || IsRuntimeMethod() || IsProxyMethod()) {
-    return nullptr;
-  }
-  Runtime* runtime = Runtime::Current();
-  const void* entry_point = runtime->GetInstrumentation()->GetQuickCodeFor(this, pointer_size);
-  // On failure, instead of nullptr we get the quick-generic-jni-trampoline for native method
-  // indicating the generic JNI, or the quick-to-interpreter-bridge (but not the trampoline)
-  // for non-native methods.
-  DCHECK_NE(entry_point, runtime->GetClassLinker()->GetQuickToInterpreterBridgeTrampoline());
-  if (UNLIKELY(entry_point == GetQuickToInterpreterBridge()) ||
-      UNLIKELY(entry_point == runtime->GetClassLinker()->GetQuickGenericJniTrampoline())) {
-    return nullptr;
-  }
-  return entry_point;
-}
-
-inline const void* ArtMethod::GetQuickOatCodePointer(size_t pointer_size) {
-  return EntryPointToCodePointer(GetQuickOatEntryPoint(pointer_size));
 }
 
 inline const uint8_t* ArtMethod::GetMappingTable(size_t pointer_size) {
@@ -275,6 +219,7 @@ inline const uint8_t* ArtMethod::GetVmapTable(size_t pointer_size) {
 }
 
 inline const uint8_t* ArtMethod::GetVmapTable(const void* code_pointer, size_t pointer_size) {
+  CHECK(!IsOptimized(pointer_size)) << "Unimplemented vmap table for optimized compiler";
   DCHECK(code_pointer != nullptr);
   DCHECK_EQ(code_pointer, GetQuickOatCodePointer(pointer_size));
   uint32_t offset =
@@ -283,6 +228,16 @@ inline const uint8_t* ArtMethod::GetVmapTable(const void* code_pointer, size_t p
     return nullptr;
   }
   return reinterpret_cast<const uint8_t*>(code_pointer) - offset;
+}
+
+inline CodeInfo ArtMethod::GetOptimizedCodeInfo() {
+  DCHECK(IsOptimized(sizeof(void*)));
+  const void* code_pointer = GetQuickOatCodePointer(sizeof(void*));
+  DCHECK(code_pointer != nullptr);
+  uint32_t offset =
+      reinterpret_cast<const OatQuickMethodHeader*>(code_pointer)[-1].vmap_table_offset_;
+  const void* data = reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(code_pointer) - offset);
+  return CodeInfo(data);
 }
 
 inline const uint8_t* ArtMethod::GetNativeGcMap(size_t pointer_size) {
@@ -337,7 +292,6 @@ inline bool ArtMethod::IsImtConflictMethod() {
   return result;
 }
 
-
 inline bool ArtMethod::IsImtUnimplementedMethod() {
   bool result = this == Runtime::Current()->GetImtUnimplementedMethod();
   // Check that if we do think it is phony it looks like the imt unimplemented method.
@@ -345,62 +299,10 @@ inline bool ArtMethod::IsImtUnimplementedMethod() {
   return result;
 }
 
-inline uintptr_t ArtMethod::NativePcOffset(const uintptr_t pc) {
-  const void* code = Runtime::Current()->GetInstrumentation()->GetQuickCodeFor(this, sizeof(void*));
+inline uintptr_t ArtMethod::NativeQuickPcOffset(const uintptr_t pc) {
+  const void* code = Runtime::Current()->GetInstrumentation()->GetQuickCodeFor(
+      this, sizeof(void*));
   return pc - reinterpret_cast<uintptr_t>(code);
-}
-
-inline uintptr_t ArtMethod::NativePcOffset(const uintptr_t pc, const void* quick_entry_point) {
-  DCHECK(quick_entry_point != GetQuickToInterpreterBridge());
-  DCHECK_EQ(quick_entry_point,
-            Runtime::Current()->GetInstrumentation()->GetQuickCodeFor(this, sizeof(void*)));
-  return pc - reinterpret_cast<uintptr_t>(quick_entry_point);
-}
-
-inline QuickMethodFrameInfo ArtMethod::GetQuickFrameInfo() {
-  if (UNLIKELY(IsPortableCompiled())) {
-    // Portable compiled dex bytecode or jni stub.
-    return QuickMethodFrameInfo(kStackAlignment, 0u, 0u);
-  }
-  Runtime* runtime = Runtime::Current();
-  // For Proxy method we exclude direct method (there is only one direct method - constructor).
-  // Direct method is cloned from original java.lang.reflect.Proxy class together with code
-  // and as a result it is executed as usual quick compiled method without any stubs.
-  // So the frame info should be returned as it is a quick method not a stub.
-  if (UNLIKELY(IsAbstract()) || UNLIKELY(IsProxyMethod() && !IsDirect())) {
-    return runtime->GetCalleeSaveMethodFrameInfo(Runtime::kRefsAndArgs);
-  }
-  if (UNLIKELY(IsRuntimeMethod())) {
-    return runtime->GetRuntimeMethodFrameInfo(this);
-  }
-
-  const void* entry_point = runtime->GetInstrumentation()->GetQuickCodeFor(this, sizeof(void*));
-  // On failure, instead of nullptr we get the quick-generic-jni-trampoline for native method
-  // indicating the generic JNI, or the quick-to-interpreter-bridge (but not the trampoline)
-  // for non-native methods. And we really shouldn't see a failure for non-native methods here.
-  DCHECK(entry_point != runtime->GetClassLinker()->GetQuickToInterpreterBridgeTrampoline());
-  CHECK(entry_point != GetQuickToInterpreterBridge());
-
-  if (UNLIKELY(entry_point == runtime->GetClassLinker()->GetQuickGenericJniTrampoline())) {
-    // Generic JNI frame.
-    DCHECK(IsNative());
-    StackHandleScope<1> hs(Thread::Current());
-    uint32_t handle_refs =
-        MethodHelper(hs.NewHandle(this)).GetNumberOfReferenceArgsWithoutReceiver() + 1;
-    size_t scope_size = HandleScope::SizeOf(handle_refs);
-    QuickMethodFrameInfo callee_info = runtime->GetCalleeSaveMethodFrameInfo(Runtime::kRefsAndArgs);
-
-    // Callee saves + handle scope + method ref + alignment
-    size_t frame_size = RoundUp(callee_info.FrameSizeInBytes() + scope_size
-                                - kPointerSize  // callee-save frame stores a whole method pointer
-                                + sizeof(StackReference<mirror::ArtMethod>),
-                                kStackAlignment);
-
-    return QuickMethodFrameInfo(frame_size, callee_info.CoreSpillMask(), callee_info.FpSpillMask());
-  }
-
-  const void* code_pointer = EntryPointToCodePointer(entry_point);
-  return GetQuickFrameInfo(code_pointer);
 }
 
 inline QuickMethodFrameInfo ArtMethod::GetQuickFrameInfo(const void* code_pointer) {
@@ -463,8 +365,7 @@ inline const char* ArtMethod::GetName() {
 }
 
 inline const DexFile::CodeItem* ArtMethod::GetCodeItem() {
-  mirror::ArtMethod* method = GetInterfaceMethodIfProxy();
-  return method->GetDexFile()->GetCodeItem(method->GetCodeItemOffset());
+  return GetDeclaringClass()->GetDexFile().GetCodeItem(GetCodeItemOffset());
 }
 
 inline bool ArtMethod::IsResolvedTypeIdx(uint16_t type_idx) {
@@ -556,6 +457,20 @@ inline void ArtMethod::SetDexCacheResolvedTypes(ObjectArray<Class>* new_dex_cach
                         new_dex_cache_classes);
 }
 
+inline mirror::Class* ArtMethod::GetReturnType(bool resolve) {
+  DCHECK(!IsProxyMethod());
+  const DexFile* dex_file = GetDexFile();
+  const DexFile::MethodId& method_id = dex_file->GetMethodId(GetDexMethodIndex());
+  const DexFile::ProtoId& proto_id = dex_file->GetMethodPrototype(method_id);
+  uint16_t return_type_idx = proto_id.return_type_idx_;
+  mirror::Class* type = GetDexCacheResolvedType(return_type_idx);
+  if (type == nullptr && resolve) {
+    type = Runtime::Current()->GetClassLinker()->ResolveType(return_type_idx, this);
+    CHECK(type != nullptr || Thread::Current()->IsExceptionPending());
+  }
+  return type;
+}
+
 inline void ArtMethod::CheckObjectSizeEqualsMirrorSize() {
   // Using the default, check the class object size to make sure it matches the size of the
   // object.
@@ -565,7 +480,6 @@ inline void ArtMethod::CheckObjectSizeEqualsMirrorSize() {
 #endif
   DCHECK_EQ(GetClass()->GetObjectSize(), this_size);
 }
-
 
 }  // namespace mirror
 }  // namespace art

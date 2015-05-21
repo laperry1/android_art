@@ -32,6 +32,8 @@ class PACKED(4) ImageHeader {
 
   ImageHeader(uint32_t image_begin,
               uint32_t image_size_,
+              uint32_t art_fields_offset,
+              uint32_t art_fields_size,
               uint32_t image_bitmap_offset,
               uint32_t image_bitmap_size,
               uint32_t image_roots,
@@ -45,12 +47,20 @@ class PACKED(4) ImageHeader {
   bool IsValid() const;
   const char* GetMagic() const;
 
-  byte* GetImageBegin() const {
-    return reinterpret_cast<byte*>(image_begin_);
+  uint8_t* GetImageBegin() const {
+    return reinterpret_cast<uint8_t*>(image_begin_);
   }
 
   size_t GetImageSize() const {
     return static_cast<uint32_t>(image_size_);
+  }
+
+  size_t GetArtFieldsOffset() const {
+    return art_fields_offset_;
+  }
+
+  size_t GetArtFieldsSize() const {
+    return art_fields_size_;
   }
 
   size_t GetImageBitmapOffset() const {
@@ -69,28 +79,24 @@ class PACKED(4) ImageHeader {
     oat_checksum_ = oat_checksum;
   }
 
-  byte* GetOatFileBegin() const {
-    return reinterpret_cast<byte*>(oat_file_begin_);
+  uint8_t* GetOatFileBegin() const {
+    return reinterpret_cast<uint8_t*>(oat_file_begin_);
   }
 
-  byte* GetOatDataBegin() const {
-    return reinterpret_cast<byte*>(oat_data_begin_);
+  uint8_t* GetOatDataBegin() const {
+    return reinterpret_cast<uint8_t*>(oat_data_begin_);
   }
 
-  byte* GetOatDataEnd() const {
-    return reinterpret_cast<byte*>(oat_data_end_);
+  uint8_t* GetOatDataEnd() const {
+    return reinterpret_cast<uint8_t*>(oat_data_end_);
   }
 
-  byte* GetOatFileEnd() const {
-    return reinterpret_cast<byte*>(oat_file_end_);
+  uint8_t* GetOatFileEnd() const {
+    return reinterpret_cast<uint8_t*>(oat_file_end_);
   }
 
   off_t GetPatchDelta() const {
     return patch_delta_;
-  }
-
-  size_t GetBitmapOffset() const {
-    return RoundUp(image_size_, kPageSize);
   }
 
   static std::string GetOatLocationFromImageLocation(const std::string& image) {
@@ -118,7 +124,8 @@ class PACKED(4) ImageHeader {
 
   mirror::Object* GetImageRoot(ImageRoot image_root) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  mirror::ObjectArray<mirror::Object>* GetImageRoots() const;
+  mirror::ObjectArray<mirror::Object>* GetImageRoots() const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   void RelocateImage(off_t delta);
 
@@ -127,17 +134,23 @@ class PACKED(4) ImageHeader {
   }
 
  private:
-  static const byte kImageMagic[4];
-  static const byte kImageVersion[4];
+  static const uint8_t kImageMagic[4];
+  static const uint8_t kImageVersion[4];
 
-  byte magic_[4];
-  byte version_[4];
+  uint8_t magic_[4];
+  uint8_t version_[4];
 
   // Required base address for mapping the image.
   uint32_t image_begin_;
 
   // Image size, not page aligned.
   uint32_t image_size_;
+
+  // ArtField array offset.
+  uint32_t art_fields_offset_;
+
+  // ArtField size in bytes.
+  uint32_t art_fields_size_;
 
   // Image bitmap offset in the file.
   uint32_t image_bitmap_offset_;

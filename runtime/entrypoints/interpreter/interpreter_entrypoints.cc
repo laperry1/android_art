@@ -15,6 +15,7 @@
  */
 
 #include "class_linker.h"
+#include "dex_file-inl.h"
 #include "interpreter/interpreter.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
@@ -24,9 +25,7 @@
 
 namespace art {
 
-// TODO: Make the MethodHelper here be compaction safe.
-extern "C" void artInterpreterToCompiledCodeBridge(Thread* self, MethodHelper& mh,
-                                                   const DexFile::CodeItem* code_item,
+extern "C" void artInterpreterToCompiledCodeBridge(Thread* self, const DexFile::CodeItem* code_item,
                                                    ShadowFrame* shadow_frame, JValue* result) {
   mirror::ArtMethod* method = shadow_frame->GetMethod();
   // Ensure static methods are initialized.
@@ -36,7 +35,8 @@ extern "C" void artInterpreterToCompiledCodeBridge(Thread* self, MethodHelper& m
       self->PushShadowFrame(shadow_frame);
       StackHandleScope<1> hs(self);
       Handle<mirror::Class> h_class(hs.NewHandle(declaringClass));
-      if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(h_class, true, true))) {
+      if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(self, h_class, true,
+                                                                            true))) {
         self->PopShadowFrame();
         DCHECK(self->IsExceptionPending());
         return;
@@ -47,14 +47,10 @@ extern "C" void artInterpreterToCompiledCodeBridge(Thread* self, MethodHelper& m
       method = shadow_frame->GetMethod();
     }
   }
-  uint16_t arg_offset = (code_item == NULL) ? 0 : code_item->registers_size_ - code_item->ins_size_;
-  if (kUsePortableCompiler) {
-    InvokeWithShadowFrame(self, shadow_frame, arg_offset, mh, result);
-  } else {
-    method->Invoke(self, shadow_frame->GetVRegArgs(arg_offset),
-                   (shadow_frame->NumberOfVRegs() - arg_offset) * sizeof(uint32_t),
-                   result, mh.GetShorty());
-  }
+  uint16_t arg_offset = (code_item == nullptr) ? 0 : code_item->registers_size_ - code_item->ins_size_;
+  method->Invoke(self, shadow_frame->GetVRegArgs(arg_offset),
+                 (shadow_frame->NumberOfVRegs() - arg_offset) * sizeof(uint32_t),
+                 result, method->GetShorty());
 }
 
 }  // namespace art

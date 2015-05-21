@@ -19,9 +19,11 @@
 #include <dirent.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <random>
 
+#include "base/macros.h"
 #include "base/stl_util.h"
 #include "base/unix_file/fd_file.h"
 #include "base/scoped_flock.h"
@@ -41,8 +43,9 @@ namespace space {
 Atomic<uint32_t> ImageSpace::bitmap_index_(0);
 
 ImageSpace::ImageSpace(const std::string& image_filename, const char* image_location,
-                       MemMap* mem_map, accounting::ContinuousSpaceBitmap* live_bitmap)
-    : MemMapSpace(image_filename, mem_map, mem_map->Begin(), mem_map->End(), mem_map->End(),
+                       MemMap* mem_map, accounting::ContinuousSpaceBitmap* live_bitmap,
+                       uint8_t* end)
+    : MemMapSpace(image_filename, mem_map, mem_map->Begin(), end, end,
                   kGcRetentionPolicyNeverCollect),
       image_location_(image_location) {
   DCHECK(live_bitmap != nullptr);
@@ -121,21 +124,50 @@ static void RealPruneDalvikCache(const std::string& cache_dir_path) {
 // every zygote boot and delete it when the boot completes. If we find a file already
 // present, it usually means the boot didn't complete. We wipe the entire dalvik
 // cache if that's the case.
-static void MarkZygoteStart(const InstructionSet isa) {
+static void MarkZygoteStart(const InstructionSet isa, const uint32_t max_failed_boots) {
   const std::string isa_subdir = GetDalvikCacheOrDie(GetInstructionSetString(isa), false);
   const std::string boot_marker = isa_subdir + "/.booting";
+  const char* file_name = boot_marker.c_str();
 
-  if (OS::FileExists(boot_marker.c_str())) {
+  uint32_t num_failed_boots = 0;
+  std::unique_ptr<File> file(OS::OpenFileReadWrite(file_name));
+  if (file.get() == nullptr) {
+    file.reset(OS::CreateEmptyFile(file_name));
+
+    if (file.get() == nullptr) {
+      PLOG(WARNING) << "Failed to create boot marker.";
+      return;
+    }
+  } else {
+    if (!file->ReadFully(&num_failed_boots, sizeof(num_failed_boots))) {
+      PLOG(WARNING) << "Failed to read boot marker.";
+      file->Erase();
+      return;
+    }
+  }
+
+  if (max_failed_boots != 0 && num_failed_boots > max_failed_boots) {
     LOG(WARNING) << "Incomplete boot detected. Pruning dalvik cache";
     RealPruneDalvikCache(isa_subdir);
   }
 
-  VLOG(startup) << "Creating boot start marker: " << boot_marker;
-  std::unique_ptr<File> f(OS::CreateEmptyFile(boot_marker.c_str()));
-  if (f.get() != nullptr) {
-    if (f->FlushCloseOrErase() != 0) {
-      PLOG(WARNING) << "Failed to write boot marker.";
-    }
+  ++num_failed_boots;
+  VLOG(startup) << "Number of failed boots on : " << boot_marker << " = " << num_failed_boots;
+
+  if (lseek(file->Fd(), 0, SEEK_SET) == -1) {
+    PLOG(WARNING) << "Failed to write boot marker.";
+    file->Erase();
+    return;
+  }
+
+  if (!file->WriteFully(&num_failed_boots, sizeof(num_failed_boots))) {
+    PLOG(WARNING) << "Failed to write boot marker.";
+    file->Erase();
+    return;
+  }
+
+  if (file->FlushCloseOrErase() != 0) {
+    PLOG(WARNING) << "Failed to flush boot marker.";
   }
 }
 
@@ -143,7 +175,7 @@ static bool GenerateImage(const std::string& image_filename, InstructionSet imag
                           std::string* error_msg) {
   const std::string boot_class_path_string(Runtime::Current()->GetBootClassPathString());
   std::vector<std::string> boot_class_path;
-  Split(boot_class_path_string, ':', boot_class_path);
+  Split(boot_class_path_string, ':', &boot_class_path);
   if (boot_class_path.empty()) {
     *error_msg = "Failed to generate image because no boot class path specified";
     return false;
@@ -170,6 +202,9 @@ static bool GenerateImage(const std::string& image_filename, InstructionSet imag
   std::string oat_file_option_string("--oat-file=");
   oat_file_option_string += ImageHeader::GetOatLocationFromImageLocation(image_filename);
   arg_vector.push_back(oat_file_option_string);
+
+  // Note: we do not generate a fully debuggable boot image so we do not pass the
+  // compiler flag --debuggable here.
 
   Runtime::Current()->AddCurrentRuntimeFeaturesAsDex2OatArguments(&arg_vector);
   CHECK_EQ(image_isa, kRuntimeISA)
@@ -449,7 +484,7 @@ ImageSpace* ImageSpace::Create(const char* image_location,
                                              &has_cache, &is_global_cache);
 
   if (Runtime::Current()->IsZygote()) {
-    MarkZygoteStart(image_isa);
+    MarkZygoteStart(image_isa, Runtime::Current()->GetZygoteMaxFailedBoots());
   }
 
   ImageSpace* space;
@@ -609,12 +644,12 @@ ImageSpace* ImageSpace::Create(const char* image_location,
 }
 
 void ImageSpace::VerifyImageAllocations() {
-  byte* current = Begin() + RoundUp(sizeof(ImageHeader), kObjectAlignment);
+  uint8_t* current = Begin() + RoundUp(sizeof(ImageHeader), kObjectAlignment);
   while (current < End()) {
-    DCHECK_ALIGNED(current, kObjectAlignment);
-    mirror::Object* obj = reinterpret_cast<mirror::Object*>(current);
-    CHECK(live_bitmap_->Test(obj));
+    CHECK_ALIGNED(current, kObjectAlignment);
+    auto* obj = reinterpret_cast<mirror::Object*>(current);
     CHECK(obj->GetClass() != nullptr) << "Image object at address " << obj << " has null class";
+    CHECK(live_bitmap_->Test(obj)) << PrettyTypeOf(obj);
     if (kUseBakerOrBrooksReadBarrier) {
       obj->AssertReadBarrierPointer();
     }
@@ -634,7 +669,7 @@ ImageSpace* ImageSpace::Init(const char* image_filename, const char* image_locat
   }
 
   std::unique_ptr<File> file(OS::OpenFileForReading(image_filename));
-  if (file.get() == NULL) {
+  if (file.get() == nullptr) {
     *error_msg = StringPrintf("Failed to open '%s'", image_filename);
     return nullptr;
   }
@@ -644,18 +679,26 @@ ImageSpace* ImageSpace::Init(const char* image_filename, const char* image_locat
     *error_msg = StringPrintf("Invalid image header in '%s'", image_filename);
     return nullptr;
   }
+  // Check that the file is large enough.
+  uint64_t image_file_size = static_cast<uint64_t>(file->GetLength());
+  if (image_header.GetImageSize() > image_file_size) {
+    *error_msg = StringPrintf("Image file too small for image heap: %" PRIu64 " vs. %zu.",
+                              image_file_size, image_header.GetImageSize());
+    return nullptr;
+  }
+  auto end_of_bitmap = image_header.GetImageBitmapOffset() + image_header.GetImageBitmapSize();
+  if (end_of_bitmap != image_file_size) {
+    *error_msg = StringPrintf(
+        "Image file size does not equal end of bitmap: size=%" PRIu64 " vs. %zu.", image_file_size,
+        end_of_bitmap);
+    return nullptr;
+  }
 
   // Note: The image header is part of the image due to mmap page alignment required of offset.
-  std::unique_ptr<MemMap> map(MemMap::MapFileAtAddress(image_header.GetImageBegin(),
-                                                 image_header.GetImageSize(),
-                                                 PROT_READ | PROT_WRITE,
-                                                 MAP_PRIVATE,
-                                                 file->Fd(),
-                                                 0,
-                                                 false,
-                                                 image_filename,
-                                                 error_msg));
-  if (map.get() == NULL) {
+  std::unique_ptr<MemMap> map(MemMap::MapFileAtAddress(
+      image_header.GetImageBegin(), image_header.GetImageSize() + image_header.GetArtFieldsSize(),
+      PROT_READ | PROT_WRITE, MAP_PRIVATE, file->Fd(), 0, false, image_filename, error_msg));
+  if (map.get() == nullptr) {
     DCHECK(!error_msg->empty());
     return nullptr;
   }
@@ -665,7 +708,7 @@ ImageSpace* ImageSpace::Init(const char* image_filename, const char* image_locat
   std::unique_ptr<MemMap> image_map(
       MemMap::MapFileAtAddress(nullptr, image_header.GetImageBitmapSize(),
                                PROT_READ, MAP_PRIVATE,
-                               file->Fd(), image_header.GetBitmapOffset(),
+                               file->Fd(), image_header.GetImageBitmapOffset(),
                                false,
                                image_filename,
                                error_msg));
@@ -678,15 +721,16 @@ ImageSpace* ImageSpace::Init(const char* image_filename, const char* image_locat
                                        bitmap_index));
   std::unique_ptr<accounting::ContinuousSpaceBitmap> bitmap(
       accounting::ContinuousSpaceBitmap::CreateFromMemMap(bitmap_name, image_map.release(),
-                                                          reinterpret_cast<byte*>(map->Begin()),
+                                                          reinterpret_cast<uint8_t*>(map->Begin()),
                                                           map->Size()));
   if (bitmap.get() == nullptr) {
     *error_msg = StringPrintf("Could not create bitmap '%s'", bitmap_name.c_str());
     return nullptr;
   }
 
+  uint8_t* const image_end = map->Begin() + image_header.GetImageSize();
   std::unique_ptr<ImageSpace> space(new ImageSpace(image_filename, image_location,
-                                             map.release(), bitmap.release()));
+                                                   map.release(), bitmap.release(), image_end));
 
   // VerifyImageAllocations() will be called later in Runtime::Init()
   // as some class roots like ArtMethod::java_lang_reflect_ArtMethod_
@@ -743,8 +787,9 @@ OatFile* ImageSpace::OpenOatFile(const char* image_path, std::string* error_msg)
 
   OatFile* oat_file = OatFile::Open(oat_filename, oat_filename, image_header.GetOatDataBegin(),
                                     image_header.GetOatFileBegin(),
-                                    !Runtime::Current()->IsCompiler(), error_msg);
-  if (oat_file == NULL) {
+                                    !Runtime::Current()->IsAotCompiler(),
+                                    nullptr, error_msg);
+  if (oat_file == nullptr) {
     *error_msg = StringPrintf("Failed to open oat file '%s' referenced from image %s: %s",
                               oat_filename.c_str(), GetName(), error_msg->c_str());
     return nullptr;
@@ -769,7 +814,7 @@ OatFile* ImageSpace::OpenOatFile(const char* image_path, std::string* error_msg)
 }
 
 bool ImageSpace::ValidateOatFile(std::string* error_msg) const {
-  CHECK(oat_file_.get() != NULL);
+  CHECK(oat_file_.get() != nullptr);
   for (const OatFile::OatDexFile* oat_dex_file : oat_file_->GetOatDexFiles()) {
     const std::string& dex_file_location = oat_dex_file->GetDexFileLocation();
     uint32_t dex_file_location_checksum;
@@ -795,7 +840,7 @@ const OatFile* ImageSpace::GetOatFile() const {
 }
 
 OatFile* ImageSpace::ReleaseOatFile() {
-  CHECK(oat_file_.get() != NULL);
+  CHECK(oat_file_.get() != nullptr);
   return oat_file_.release();
 }
 

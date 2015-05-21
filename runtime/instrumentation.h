@@ -21,24 +21,22 @@
 #include <list>
 #include <map>
 
-#include "atomic.h"
-#include "instruction_set.h"
+#include "arch/instruction_set.h"
 #include "base/macros.h"
 #include "base/mutex.h"
 #include "gc_root.h"
-#include "object_callbacks.h"
+#include "safe_map.h"
 
 namespace art {
 namespace mirror {
-  class ArtField;
   class ArtMethod;
   class Class;
   class Object;
   class Throwable;
 }  // namespace mirror
+class ArtField;
 union JValue;
 class Thread;
-class ThrowLocation;
 
 namespace instrumentation {
 
@@ -49,6 +47,11 @@ enum InterpreterHandlerTable {
                                   // enabled.
   kNumHandlerTables
 };
+
+// Do we want to deoptimize for method entry and exit listeners or just try to intercept
+// invocations? Deoptimization forces all code to run in the interpreter and considerably hurts the
+// application's performance.
+static constexpr bool kDeoptimizeForAccurateMethodEntryExitListeners = true;
 
 // Instrumentation event listener API. Registered listeners will get the appropriate call back for
 // the events they are listening for. The call backs supply the thread, method and dex_pc the event
@@ -63,8 +66,6 @@ struct InstrumentationListener {
                              uint32_t dex_pc) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) = 0;
 
   // Call-back for when a method is exited.
-  // TODO: its likely passing the return value would be useful, however, we may need to get and
-  //       parse the shorty to determine what kind of register holds the result.
   virtual void MethodExited(Thread* thread, mirror::Object* this_object,
                             mirror::ArtMethod* method, uint32_t dex_pc,
                             const JValue& return_value)
@@ -83,16 +84,18 @@ struct InstrumentationListener {
 
   // Call-back for when we read from a field.
   virtual void FieldRead(Thread* thread, mirror::Object* this_object, mirror::ArtMethod* method,
-                         uint32_t dex_pc, mirror::ArtField* field) = 0;
+                         uint32_t dex_pc, ArtField* field) = 0;
 
   // Call-back for when we write into a field.
   virtual void FieldWritten(Thread* thread, mirror::Object* this_object, mirror::ArtMethod* method,
-                            uint32_t dex_pc, mirror::ArtField* field, const JValue& field_value) = 0;
+                            uint32_t dex_pc, ArtField* field, const JValue& field_value) = 0;
 
   // Call-back when an exception is caught.
-  virtual void ExceptionCaught(Thread* thread, const ThrowLocation& throw_location,
-                               mirror::ArtMethod* catch_method, uint32_t catch_dex_pc,
-                               mirror::Throwable* exception_object)
+  virtual void ExceptionCaught(Thread* thread, mirror::Throwable* exception_object)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) = 0;
+
+  // Call-back for when we get a backward branch.
+  virtual void BackwardBranch(Thread* thread, mirror::ArtMethod* method, int32_t dex_pc_offset)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) = 0;
 };
 
@@ -103,13 +106,20 @@ struct InstrumentationListener {
 class Instrumentation {
  public:
   enum InstrumentationEvent {
-    kMethodEntered =   1 << 0,
-    kMethodExited =    1 << 1,
-    kMethodUnwind =    1 << 2,
-    kDexPcMoved =      1 << 3,
-    kFieldRead =       1 << 4,
-    kFieldWritten =    1 << 5,
-    kExceptionCaught = 1 << 6,
+    kMethodEntered = 0x1,
+    kMethodExited = 0x2,
+    kMethodUnwind = 0x4,
+    kDexPcMoved = 0x8,
+    kFieldRead = 0x10,
+    kFieldWritten = 0x20,
+    kExceptionCaught = 0x40,
+    kBackwardBranch = 0x80,
+  };
+
+  enum class InstrumentationLevel {
+    kInstrumentNothing,                   // execute without instrumentation
+    kInstrumentWithInstrumentationStubs,  // execute with instrumentation entry/exit stubs
+    kInstrumentWithInterpreter            // execute with interpreter
   };
 
   Instrumentation();
@@ -131,7 +141,7 @@ class Instrumentation {
   void EnableDeoptimization()
       EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_)
       LOCKS_EXCLUDED(deoptimized_methods_lock_);
-  void DisableDeoptimization()
+  void DisableDeoptimization(const char* key)
       EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_)
       LOCKS_EXCLUDED(deoptimized_methods_lock_);
   bool AreAllMethodsDeoptimized() const {
@@ -140,12 +150,12 @@ class Instrumentation {
   bool ShouldNotifyMethodEnterExitEvents() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Executes everything with interpreter.
-  void DeoptimizeEverything()
+  void DeoptimizeEverything(const char* key)
       EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_)
       LOCKS_EXCLUDED(Locks::thread_list_lock_, Locks::classlinker_classes_lock_);
 
   // Executes everything with compiled code (or interpreter if there is no code).
-  void UndeoptimizeEverything()
+  void UndeoptimizeEverything(const char* key)
       EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_)
       LOCKS_EXCLUDED(Locks::thread_list_lock_, Locks::classlinker_classes_lock_);
 
@@ -163,17 +173,19 @@ class Instrumentation {
       LOCKS_EXCLUDED(Locks::thread_list_lock_, deoptimized_methods_lock_)
       EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+  // Indicates whether the method has been deoptimized so it is executed with the interpreter.
   bool IsDeoptimized(mirror::ArtMethod* method)
       LOCKS_EXCLUDED(deoptimized_methods_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  // Enable method tracing by installing instrumentation entry/exit stubs.
-  void EnableMethodTracing()
+  // Enable method tracing by installing instrumentation entry/exit stubs or interpreter.
+  void EnableMethodTracing(const char* key,
+                           bool needs_interpreter = kDeoptimizeForAccurateMethodEntryExitListeners)
       EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_)
       LOCKS_EXCLUDED(Locks::thread_list_lock_, Locks::classlinker_classes_lock_);
 
-  // Disable method tracing by uninstalling instrumentation entry/exit stubs.
-  void DisableMethodTracing()
+  // Disable method tracing by uninstalling instrumentation entry/exit stubs or interpreter.
+  void DisableMethodTracing(const char* key)
       EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_)
       LOCKS_EXCLUDED(Locks::thread_list_lock_, Locks::classlinker_classes_lock_);
 
@@ -193,8 +205,7 @@ class Instrumentation {
   void ResetQuickAllocEntryPoints() EXCLUSIVE_LOCKS_REQUIRED(Locks::runtime_shutdown_lock_);
 
   // Update the code of a method respecting any installed stubs.
-  void UpdateMethodsCode(mirror::ArtMethod* method, const void* quick_code,
-                         const void* portable_code, bool have_portable_code)
+  void UpdateMethodsCode(mirror::ArtMethod* method, const void* quick_code)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Get the quick code for the given method. More efficient than asking the class linker as it
@@ -217,10 +228,6 @@ class Instrumentation {
     return forced_interpret_only_;
   }
 
-  bool ShouldPortableCodeDeoptimize() const {
-    return instrumentation_stubs_installed_;
-  }
-
   bool AreExitStubsInstalled() const {
     return instrumentation_stubs_installed_;
   }
@@ -231,6 +238,10 @@ class Instrumentation {
 
   bool HasMethodExitListeners() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     return have_method_exit_listeners_;
+  }
+
+  bool HasMethodUnwindListeners() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return have_method_unwind_listeners_;
   }
 
   bool HasDexPcListeners() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
@@ -247,6 +258,10 @@ class Instrumentation {
 
   bool HasExceptionCaughtListeners() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     return have_exception_caught_listeners_;
+  }
+
+  bool HasBackwardBranchListeners() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return have_backward_branch_listeners_;
   }
 
   bool IsActive() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
@@ -289,10 +304,18 @@ class Instrumentation {
     }
   }
 
+  // Inform listeners that a backward branch has been taken (only supported by the interpreter).
+  void BackwardBranch(Thread* thread, mirror::ArtMethod* method, int32_t offset) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    if (UNLIKELY(HasBackwardBranchListeners())) {
+      BackwardBranchImpl(thread, method, offset);
+    }
+  }
+
   // Inform listeners that we read a field (only supported by the interpreter).
   void FieldReadEvent(Thread* thread, mirror::Object* this_object,
                       mirror::ArtMethod* method, uint32_t dex_pc,
-                      mirror::ArtField* field) const
+                      ArtField* field) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     if (UNLIKELY(HasFieldReadListeners())) {
       FieldReadEventImpl(thread, this_object, method, dex_pc, field);
@@ -302,7 +325,7 @@ class Instrumentation {
   // Inform listeners that we write a field (only supported by the interpreter).
   void FieldWriteEvent(Thread* thread, mirror::Object* this_object,
                        mirror::ArtMethod* method, uint32_t dex_pc,
-                       mirror::ArtField* field, const JValue& field_value) const
+                       ArtField* field, const JValue& field_value) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     if (UNLIKELY(HasFieldWriteListeners())) {
       FieldWriteEventImpl(thread, this_object, method, dex_pc, field, field_value);
@@ -310,9 +333,7 @@ class Instrumentation {
   }
 
   // Inform listeners that an exception was caught.
-  void ExceptionCaughtEvent(Thread* thread, const ThrowLocation& throw_location,
-                            mirror::ArtMethod* catch_method, uint32_t catch_dex_pc,
-                            mirror::Throwable* exception_object) const
+  void ExceptionCaughtEvent(Thread* thread, mirror::Throwable* exception_object) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Called when an instrumented method is entered. The intended link register (lr) is saved so
@@ -333,17 +354,23 @@ class Instrumentation {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Call back for configure stubs.
-  bool InstallStubsForClass(mirror::Class* klass) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void InstallStubsForClass(mirror::Class* klass) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   void InstallStubsForMethod(mirror::ArtMethod* method)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void VisitRoots(RootCallback* callback, void* arg) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
+  void VisitRoots(RootVisitor* visitor) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
       LOCKS_EXCLUDED(deoptimized_methods_lock_);
 
  private:
+  InstrumentationLevel GetCurrentInstrumentationLevel() const;
+
   // Does the job of installing or removing instrumentation code within methods.
-  void ConfigureStubs(bool require_entry_exit_stubs, bool require_interpreter)
+  // In order to support multiple clients using instrumentation at the same time,
+  // the caller must pass a unique key (a string) identifying it so we remind which
+  // instrumentation level it needs. Therefore the current instrumentation level
+  // becomes the highest instrumentation level required by a client.
+  void ConfigureStubs(const char* key, InstrumentationLevel desired_instrumentation_level)
       EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_)
       LOCKS_EXCLUDED(Locks::thread_list_lock_, Locks::classlinker_classes_lock_,
                      deoptimized_methods_lock_);
@@ -366,13 +393,15 @@ class Instrumentation {
   void DexPcMovedEventImpl(Thread* thread, mirror::Object* this_object,
                            mirror::ArtMethod* method, uint32_t dex_pc) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void BackwardBranchImpl(Thread* thread, mirror::ArtMethod* method, int32_t offset) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   void FieldReadEventImpl(Thread* thread, mirror::Object* this_object,
                            mirror::ArtMethod* method, uint32_t dex_pc,
-                           mirror::ArtField* field) const
+                           ArtField* field) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   void FieldWriteEventImpl(Thread* thread, mirror::Object* this_object,
                            mirror::ArtMethod* method, uint32_t dex_pc,
-                           mirror::ArtField* field, const JValue& field_value) const
+                           ArtField* field, const JValue& field_value) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Read barrier-aware utility functions for accessing deoptimized_methods_
@@ -434,10 +463,19 @@ class Instrumentation {
   // Do we have any exception caught listeners? Short-cut to avoid taking the instrumentation_lock_.
   bool have_exception_caught_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
+  // Do we have any backward branch listeners? Short-cut to avoid taking the instrumentation_lock_.
+  bool have_backward_branch_listeners_ GUARDED_BY(Locks::mutator_lock_);
+
+  // Contains the instrumentation level required by each client of the instrumentation identified
+  // by a string key.
+  typedef SafeMap<const char*, InstrumentationLevel> InstrumentationLevelTable;
+  InstrumentationLevelTable requested_instrumentation_levels_ GUARDED_BY(Locks::mutator_lock_);
+
   // The event listeners, written to with the mutator_lock_ exclusively held.
   std::list<InstrumentationListener*> method_entry_listeners_ GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> method_exit_listeners_ GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> method_unwind_listeners_ GUARDED_BY(Locks::mutator_lock_);
+  std::list<InstrumentationListener*> backward_branch_listeners_ GUARDED_BY(Locks::mutator_lock_);
   std::shared_ptr<std::list<InstrumentationListener*>> dex_pc_listeners_
       GUARDED_BY(Locks::mutator_lock_);
   std::shared_ptr<std::list<InstrumentationListener*>> field_read_listeners_
@@ -462,8 +500,12 @@ class Instrumentation {
   size_t quick_alloc_entry_points_instrumentation_counter_
       GUARDED_BY(Locks::instrument_entrypoints_lock_);
 
+  friend class InstrumentationTest;  // For GetCurrentInstrumentationLevel and ConfigureStubs.
+
   DISALLOW_COPY_AND_ASSIGN(Instrumentation);
 };
+std::ostream& operator<<(std::ostream& os, const Instrumentation::InstrumentationEvent& rhs);
+std::ostream& operator<<(std::ostream& os, const Instrumentation::InstrumentationLevel& rhs);
 
 // An element in the instrumentation side stack maintained in art::Thread.
 struct InstrumentationStackFrame {

@@ -80,13 +80,14 @@ class InternTable {
   // Total number of strongly live interned strings.
   size_t WeakSize() const LOCKS_EXCLUDED(Locks::intern_table_lock_);
 
-  void VisitRoots(RootCallback* callback, void* arg, VisitRootFlags flags)
+  void VisitRoots(RootVisitor* visitor, VisitRootFlags flags)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   void DumpForSigQuit(std::ostream& os) const;
 
-  void DisallowNewInterns() EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void DisallowNewInterns() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   void AllowNewInterns() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void EnsureNewInternsDisallowed() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Adds all of the resolved image strings from the image space into the intern table. The
   // advantage of doing this is preventing expensive DexFile::FindStringId calls.
@@ -124,7 +125,7 @@ class InternTable {
     void Remove(mirror::String* s)
         SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
         EXCLUSIVE_LOCKS_REQUIRED(Locks::intern_table_lock_);
-    void VisitRoots(RootCallback* callback, void* arg)
+    void VisitRoots(RootVisitor* visitor)
         SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
         EXCLUSIVE_LOCKS_REQUIRED(Locks::intern_table_lock_);
     void SweepWeaks(IsMarkedCallback* callback, void* arg)
@@ -149,7 +150,7 @@ class InternTable {
     UnorderedSet post_zygote_table_;
   };
 
-  // Insert if non null, otherwise return nullptr.
+  // Insert if non null, otherwise return null.
   mirror::String* Insert(mirror::String* s, bool is_strong)
       LOCKS_EXCLUDED(Locks::intern_table_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);

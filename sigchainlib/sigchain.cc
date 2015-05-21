@@ -30,6 +30,7 @@
 
 #if defined(__APPLE__)
 #define _NSIG NSIG
+#define sighandler_t sig_t
 #endif
 
 namespace art {
@@ -38,7 +39,7 @@ typedef int (*SigActionFnPtr)(int, const struct sigaction*, struct sigaction*);
 
 class SignalAction {
  public:
-  SignalAction() : claimed_(false) {
+  SignalAction() : claimed_(false), uses_old_style_(false) {
   }
 
   // Claim the signal and keep the action specified.
@@ -50,7 +51,7 @@ class SignalAction {
   // Unclaim the signal and restore the old action.
   void Unclaim(int signal) {
     claimed_ = false;
-    sigaction(signal, &action_, NULL);        // Restore old action.
+    sigaction(signal, &action_, nullptr);        // Restore old action.
   }
 
   // Get the action associated with this signal.
@@ -64,13 +65,22 @@ class SignalAction {
   }
 
   // Change the recorded action to that specified.
-  void SetAction(const struct sigaction& action) {
+  // If oldstyle is true then this action is from an older style signal()
+  // call as opposed to sigaction().  In this case the sa_handler is
+  // used when invoking the user's handler.
+  void SetAction(const struct sigaction& action, bool oldstyle) {
     action_ = action;
+    uses_old_style_ = oldstyle;
+  }
+
+  bool OldStyle() const {
+    return uses_old_style_;
   }
 
  private:
   struct sigaction action_;     // Action to be performed.
   bool claimed_;                // Whether signal is claimed or not.
+  bool uses_old_style_;         // Action is created using signal().  Use sa_handler.
 };
 
 // User's signal handlers
@@ -122,19 +132,19 @@ extern "C" void InvokeUserSignalHandler(int sig, siginfo_t* info, void* context)
   }
 
   const struct sigaction& action = user_sigactions[sig].GetAction();
-  if ((action.sa_flags & SA_SIGINFO) == 0) {
-    if (action.sa_handler != NULL) {
+  if (user_sigactions[sig].OldStyle()) {
+    if (action.sa_handler != nullptr) {
       action.sa_handler(sig);
     } else {
-       signal(sig, SIG_DFL);
-       raise(sig);
+      signal(sig, SIG_DFL);
+      raise(sig);
     }
   } else {
-    if (action.sa_sigaction != NULL) {
+    if (action.sa_sigaction != nullptr) {
       action.sa_sigaction(sig, info, context);
     } else {
-       signal(sig, SIG_DFL);
-       raise(sig);
+      signal(sig, SIG_DFL);
+      raise(sig);
     }
   }
 }
@@ -154,19 +164,18 @@ extern "C" void EnsureFrontOfChain(int signal, struct sigaction* expected_action
   }
 }
 
-// These functions are C linkage since they replace the functions in libc.
-
 extern "C" int sigaction(int signal, const struct sigaction* new_action, struct sigaction* old_action) {
   // If this signal has been claimed as a signal chain, record the user's
   // action but don't pass it on to the kernel.
   // Note that we check that the signal number is in range here.  An out of range signal
   // number should behave exactly as the libc sigaction.
-  if (signal > 0 && signal < _NSIG && user_sigactions[signal].IsClaimed()) {
+  if (signal > 0 && signal < _NSIG && user_sigactions[signal].IsClaimed() &&
+      (new_action == nullptr || new_action->sa_handler != SIG_DFL)) {
     struct sigaction saved_action = user_sigactions[signal].GetAction();
-    if (new_action != NULL) {
-      user_sigactions[signal].SetAction(*new_action);
+    if (new_action != nullptr) {
+      user_sigactions[signal].SetAction(*new_action, false);
     }
-    if (old_action != NULL) {
+    if (old_action != nullptr) {
       *old_action = saved_action;
     }
     return 0;
@@ -191,10 +200,49 @@ extern "C" int sigaction(int signal, const struct sigaction* new_action, struct 
   return linked_sigaction(signal, new_action, old_action);
 }
 
+extern "C" sighandler_t signal(int signal, sighandler_t handler) {
+  struct sigaction sa;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_handler = handler;
+  sa.sa_flags = SA_RESTART;
+  sighandler_t oldhandler;
+
+  // If this signal has been claimed as a signal chain, record the user's
+  // action but don't pass it on to the kernel.
+  // Note that we check that the signal number is in range here.  An out of range signal
+  // number should behave exactly as the libc sigaction.
+  if (signal > 0 && signal < _NSIG && user_sigactions[signal].IsClaimed() && handler != SIG_DFL) {
+    oldhandler = reinterpret_cast<sighandler_t>(user_sigactions[signal].GetAction().sa_handler);
+    user_sigactions[signal].SetAction(sa, true);
+    return oldhandler;
+  }
+
+  // Will only get here if the signal chain has not been claimed.  We want
+  // to pass the sigaction on to the kernel via the real sigaction in libc.
+
+  if (linked_sigaction_sym == nullptr) {
+    // Perform lazy initialization.
+    InitializeSignalChain();
+  }
+
+  if (linked_sigaction_sym == nullptr) {
+    log("Unable to find next sigaction in signal chain");
+    abort();
+  }
+
+  typedef int (*SigAction)(int, const struct sigaction*, struct sigaction*);
+  SigAction linked_sigaction = reinterpret_cast<SigAction>(linked_sigaction_sym);
+  if (linked_sigaction(signal, &sa, &sa) == -1) {
+    return SIG_ERR;
+  }
+
+  return reinterpret_cast<sighandler_t>(sa.sa_handler);
+}
+
 extern "C" int sigprocmask(int how, const sigset_t* bionic_new_set, sigset_t* bionic_old_set) {
   const sigset_t* new_set_ptr = bionic_new_set;
   sigset_t tmpset;
-  if (bionic_new_set != NULL) {
+  if (bionic_new_set != nullptr) {
     tmpset = *bionic_new_set;
 
     if (how == SIG_BLOCK) {
@@ -202,7 +250,7 @@ extern "C" int sigprocmask(int how, const sigset_t* bionic_new_set, sigset_t* bi
       // we can't allow the user to block that signal.
       for (int i = 0 ; i < _NSIG; ++i) {
         if (user_sigactions[i].IsClaimed() && sigismember(&tmpset, i)) {
-            sigdelset(&tmpset, i);
+          sigdelset(&tmpset, i);
         }
       }
     }
@@ -239,8 +287,8 @@ extern "C" void InitializeSignalChain() {
   if (linked_sigaction_sym == nullptr) {
     linked_sigaction_sym = dlsym(RTLD_DEFAULT, "sigaction");
     if (linked_sigaction_sym == nullptr ||
-      linked_sigaction_sym == reinterpret_cast<void*>(sigaction)) {
-        linked_sigaction_sym = nullptr;
+        linked_sigaction_sym == reinterpret_cast<void*>(sigaction)) {
+      linked_sigaction_sym = nullptr;
     }
   }
 
@@ -249,10 +297,11 @@ extern "C" void InitializeSignalChain() {
     linked_sigprocmask_sym = dlsym(RTLD_DEFAULT, "sigprocmask");
     if (linked_sigprocmask_sym == nullptr ||
         linked_sigprocmask_sym == reinterpret_cast<void*>(sigprocmask)) {
-         linked_sigprocmask_sym = nullptr;
+      linked_sigprocmask_sym = nullptr;
     }
   }
   initialized = true;
 }
+
 }   // namespace art
 

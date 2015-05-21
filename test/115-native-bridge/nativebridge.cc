@@ -18,13 +18,14 @@
 
 #include <algorithm>
 #include <dlfcn.h>
+#include <jni.h>
 #include <vector>
 
-#include "jni.h"
 #include "stdio.h"
 #include "unistd.h"
 #include "sys/stat.h"
 
+#include "base/macros.h"
 #include "nativebridge/native_bridge.h"
 
 struct NativeBridgeMethod {
@@ -121,6 +122,14 @@ static jobject trampoline_Java_Main_testGetMirandaMethodNative(JNIEnv* env, jcla
   return fnPtr(env, klass);
 }
 
+static void trampoline_Java_Main_testNewStringObject(JNIEnv* env, jclass klass) {
+  typedef void (*FnPtr_t)(JNIEnv*, jclass);
+  FnPtr_t fnPtr = reinterpret_cast<FnPtr_t>
+    (find_native_bridge_method("testNewStringObject")->fnPtr);
+  printf("%s called!\n", __FUNCTION__);
+  return fnPtr(env, klass);
+}
+
 static void trampoline_Java_Main_testZeroLengthByteBuffers(JNIEnv* env, jclass klass) {
   typedef void (*FnPtr_t)(JNIEnv*, jclass);
   FnPtr_t fnPtr = reinterpret_cast<FnPtr_t>
@@ -189,6 +198,8 @@ NativeBridgeMethod gNativeBridgeMethods[] = {
     reinterpret_cast<void*>(trampoline_Java_Main_testFindFieldOnAttachedNativeThreadNative) },
   { "testGetMirandaMethodNative", "()Ljava/lang/reflect/Method;", true, nullptr,
     reinterpret_cast<void*>(trampoline_Java_Main_testGetMirandaMethodNative) },
+  { "testNewStringObject", "()V", true, nullptr,
+    reinterpret_cast<void*>(trampoline_Java_Main_testNewStringObject) },
   { "testZeroLengthByteBuffers", "()V", true, nullptr,
     reinterpret_cast<void*>(trampoline_Java_Main_testZeroLengthByteBuffers) },
 };
@@ -209,7 +220,8 @@ static NativeBridgeMethod* find_native_bridge_method(const char *name) {
 
 // NativeBridgeCallbacks implementations
 extern "C" bool native_bridge_initialize(const android::NativeBridgeRuntimeCallbacks* art_cbs,
-                                         const char* app_code_cache_dir, const char* isa) {
+                                         const char* app_code_cache_dir,
+                                         const char* isa ATTRIBUTE_UNUSED) {
   struct stat st;
   if ((app_code_cache_dir != nullptr)
       && (stat(app_code_cache_dir, &st) == 0)
@@ -248,7 +260,7 @@ extern "C" void* native_bridge_loadLibrary(const char* libpath, int flag) {
 }
 
 extern "C" void* native_bridge_getTrampoline(void* handle, const char* name, const char* shorty,
-                                             uint32_t len) {
+                                             uint32_t len ATTRIBUTE_UNUSED) {
   printf("Getting trampoline for %s with shorty %s.\n", name, shorty);
 
   // The name here is actually the JNI name, so we can directly do the lookup.
@@ -315,5 +327,7 @@ android::NativeBridgeCallbacks NativeBridgeItf {
   .loadLibrary = &native_bridge_loadLibrary,
   .getTrampoline = &native_bridge_getTrampoline,
   .isSupported = &native_bridge_isSupported,
-  .getAppEnv = &native_bridge_getAppEnv
+  .getAppEnv = &native_bridge_getAppEnv,
+  .isCompatibleWith = nullptr,
+  .getSignalHandler = nullptr
 };

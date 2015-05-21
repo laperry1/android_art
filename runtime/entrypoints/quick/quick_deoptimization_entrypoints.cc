@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "base/logging.h"
 #include "callee_save_frame.h"
 #include "dex_file-inl.h"
 #include "interpreter/interpreter.h"
@@ -27,10 +28,15 @@
 
 namespace art {
 
-extern "C" void artDeoptimize(Thread* self, StackReference<mirror::ArtMethod>* sp)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  FinishCalleeSaveFrameSetup(self, sp, Runtime::kSaveAll);
-  self->SetException(ThrowLocation(), Thread::GetDeoptimizationException());
+extern "C" NO_RETURN void artDeoptimize(Thread* self) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  ScopedQuickEntrypointChecks sqec(self);
+
+  if (VLOG_IS_ON(deopt)) {
+    LOG(INFO) << "Deopting:";
+    self->Dump(LOG(INFO));
+  }
+
+  self->SetException(Thread::GetDeoptimizationException());
   self->QuickDeliverException();
 }
 

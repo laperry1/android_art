@@ -37,100 +37,110 @@
 
 namespace art {
 namespace mirror {
-class ArtField;
 class ArtMethod;
 class Class;
 class Object;
 class Throwable;
 }  // namespace mirror
 class AllocRecord;
+class ArtField;
 class ObjectRegistry;
 class ScopedObjectAccessUnchecked;
 class StackVisitor;
 class Thread;
-class ThrowLocation;
 
 /*
  * Invoke-during-breakpoint support.
  */
 struct DebugInvokeReq {
-  DebugInvokeReq()
-      : ready(false), invoke_needed(false),
-        receiver(NULL), thread(NULL), klass(NULL), method(NULL),
-        arg_count(0), arg_values(NULL), options(0), error(JDWP::ERR_NONE),
-        result_tag(JDWP::JT_VOID), exception(0),
+  DebugInvokeReq(mirror::Object* invoke_receiver, mirror::Class* invoke_class,
+                 mirror::ArtMethod* invoke_method, uint32_t invoke_options,
+                 uint64_t* args, uint32_t args_count)
+      : receiver(invoke_receiver), klass(invoke_class), method(invoke_method),
+        arg_count(args_count), arg_values(args), options(invoke_options),
+        error(JDWP::ERR_NONE), result_tag(JDWP::JT_VOID), result_value(0), exception(0),
         lock("a DebugInvokeReq lock", kBreakpointInvokeLock),
         cond("a DebugInvokeReq condition variable", lock) {
   }
 
-  /* boolean; only set when we're in the tail end of an event handler */
-  bool ready;
-
-  /* boolean; set if the JDWP thread wants this thread to do work */
-  bool invoke_needed;
-
   /* request */
-  mirror::Object* receiver;      /* not used for ClassType.InvokeMethod */
-  mirror::Object* thread;
-  mirror::Class* klass;
-  mirror::ArtMethod* method;
-  uint32_t arg_count;
-  uint64_t* arg_values;   /* will be NULL if arg_count_ == 0 */
-  uint32_t options;
+  GcRoot<mirror::Object> receiver;      // not used for ClassType.InvokeMethod
+  GcRoot<mirror::Class> klass;
+  GcRoot<mirror::ArtMethod> method;
+  const uint32_t arg_count;
+  uint64_t* const arg_values;   // will be null if arg_count_ == 0
+  const uint32_t options;
 
   /* result */
   JDWP::JdwpError error;
   JDWP::JdwpTag result_tag;
-  JValue result_value;
+  uint64_t result_value;        // either a primitive value or an ObjectId
   JDWP::ObjectId exception;
 
   /* condition variable to wait on while the method executes */
   Mutex lock DEFAULT_MUTEX_ACQUIRED_AFTER;
   ConditionVariable cond GUARDED_BY(lock);
 
-  void VisitRoots(RootCallback* callback, void* arg, const RootInfo& root_info)
+  void VisitRoots(RootVisitor* visitor, const RootInfo& root_info)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  void Clear();
 
  private:
   DISALLOW_COPY_AND_ASSIGN(DebugInvokeReq);
 };
 
 // Thread local data-structure that holds fields for controlling single-stepping.
-struct SingleStepControl {
-  SingleStepControl()
-      : is_active(false), step_size(JDWP::SS_MIN), step_depth(JDWP::SD_INTO),
-        method(nullptr), stack_depth(0) {
+class SingleStepControl {
+ public:
+  SingleStepControl(JDWP::JdwpStepSize step_size, JDWP::JdwpStepDepth step_depth,
+                    int stack_depth, mirror::ArtMethod* method)
+      : step_size_(step_size), step_depth_(step_depth),
+        stack_depth_(stack_depth), method_(method) {
   }
 
-  // Are we single-stepping right now?
-  bool is_active;
+  JDWP::JdwpStepSize GetStepSize() const {
+    return step_size_;
+  }
 
+  JDWP::JdwpStepDepth GetStepDepth() const {
+    return step_depth_;
+  }
+
+  int GetStackDepth() const {
+    return stack_depth_;
+  }
+
+  mirror::ArtMethod* GetMethod() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return method_.Read();
+  }
+
+  const std::set<uint32_t>& GetDexPcs() const {
+    return dex_pcs_;
+  }
+
+  void VisitRoots(RootVisitor* visitor, const RootInfo& root_info)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  void AddDexPc(uint32_t dex_pc);
+
+  bool ContainsDexPc(uint32_t dex_pc) const;
+
+ private:
   // See JdwpStepSize and JdwpStepDepth for details.
-  JDWP::JdwpStepSize step_size;
-  JDWP::JdwpStepDepth step_depth;
+  const JDWP::JdwpStepSize step_size_;
+  const JDWP::JdwpStepDepth step_depth_;
+
+  // The stack depth when this single-step was initiated. This is used to support SD_OVER and SD_OUT
+  // single-step depth.
+  const int stack_depth_;
 
   // The location this single-step was initiated from.
   // A single-step is initiated in a suspended thread. We save here the current method and the
   // set of DEX pcs associated to the source line number where the suspension occurred.
   // This is used to support SD_INTO and SD_OVER single-step depths so we detect when a single-step
   // causes the execution of an instruction in a different method or at a different line number.
-  mirror::ArtMethod* method;
-  std::set<uint32_t> dex_pcs;
+  GcRoot<mirror::ArtMethod> method_;
+  std::set<uint32_t> dex_pcs_;
 
-  // The stack depth when this single-step was initiated. This is used to support SD_OVER and SD_OUT
-  // single-step depth.
-  int stack_depth;
-
-  void VisitRoots(RootCallback* callback, void* arg, const RootInfo& root_info)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  bool ContainsDexPc(uint32_t dex_pc) const;
-
-  void Clear();
-
- private:
   DISALLOW_COPY_AND_ASSIGN(SingleStepControl);
 };
 
@@ -190,6 +200,7 @@ class DeoptimizationRequest {
   // Method for selective deoptimization.
   jmethodID method_;
 };
+std::ostream& operator<<(std::ostream& os, const DeoptimizationRequest::Kind& rhs);
 
 class Dbg {
  public:
@@ -206,7 +217,6 @@ class Dbg {
     std::multimap<int32_t, jobject> objects_;
   };
 
-  static bool ParseJdwpOptions(const std::string& options);
   static void SetJdwpAllowed(bool allowed);
 
   static void StartJdwp();
@@ -229,16 +239,30 @@ class Dbg {
   static void GoActive()
       LOCKS_EXCLUDED(Locks::breakpoint_lock_, Locks::deoptimization_lock_, Locks::mutator_lock_);
   static void Disconnected() LOCKS_EXCLUDED(Locks::deoptimization_lock_, Locks::mutator_lock_);
-  static void Disposed();
+  static void Dispose() {
+    gDisposed = true;
+  }
 
   // Returns true if we're actually debugging with a real debugger, false if it's
   // just DDMS (or nothing at all).
-  static bool IsDebuggerActive();
+  static bool IsDebuggerActive() {
+    return gDebuggerActive;
+  }
+
+  // Configures JDWP with parsed command-line options.
+  static void ConfigureJdwp(const JDWP::JdwpOptions& jdwp_options);
 
   // Returns true if we had -Xrunjdwp or -agentlib:jdwp= on the command line.
   static bool IsJdwpConfigured();
 
-  static bool IsDisposed();
+  // Returns true if a method has any breakpoints.
+  static bool MethodHasAnyBreakpoints(mirror::ArtMethod* method)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
+      LOCKS_EXCLUDED(Locks::breakpoint_lock_);
+
+  static bool IsDisposed() {
+    return gDisposed;
+  }
 
   /*
    * Time, in milliseconds, since the last debugger activity.  Does not
@@ -258,9 +282,9 @@ class Dbg {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static std::string GetClassName(mirror::Class* klass)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static JDWP::JdwpError GetClassObject(JDWP::RefTypeId id, JDWP::ObjectId& class_object_id)
+  static JDWP::JdwpError GetClassObject(JDWP::RefTypeId id, JDWP::ObjectId* class_object_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static JDWP::JdwpError GetSuperclass(JDWP::RefTypeId id, JDWP::RefTypeId& superclass_id)
+  static JDWP::JdwpError GetSuperclass(JDWP::RefTypeId id, JDWP::RefTypeId* superclass_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetClassLoader(JDWP::RefTypeId id, JDWP::ExpandBuf* pReply)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -268,38 +292,38 @@ class Dbg {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetReflectedType(JDWP::RefTypeId class_id, JDWP::ExpandBuf* pReply)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static void GetClassList(std::vector<JDWP::RefTypeId>& classes)
+  static void GetClassList(std::vector<JDWP::RefTypeId>* classes)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetClassInfo(JDWP::RefTypeId class_id, JDWP::JdwpTypeTag* pTypeTag,
                                       uint32_t* pStatus, std::string* pDescriptor)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static void FindLoadedClassBySignature(const char* descriptor, std::vector<JDWP::RefTypeId>& ids)
+  static void FindLoadedClassBySignature(const char* descriptor, std::vector<JDWP::RefTypeId>* ids)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetReferenceType(JDWP::ObjectId object_id, JDWP::ExpandBuf* pReply)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetSignature(JDWP::RefTypeId ref_type_id, std::string* signature)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static JDWP::JdwpError GetSourceFile(JDWP::RefTypeId ref_type_id, std::string& source_file)
+  static JDWP::JdwpError GetSourceFile(JDWP::RefTypeId ref_type_id, std::string* source_file)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static JDWP::JdwpError GetObjectTag(JDWP::ObjectId object_id, uint8_t& tag)
+  static JDWP::JdwpError GetObjectTag(JDWP::ObjectId object_id, uint8_t* tag)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static size_t GetTagWidth(JDWP::JdwpTag tag);
 
-  static JDWP::JdwpError GetArrayLength(JDWP::ObjectId array_id, int& length)
+  static JDWP::JdwpError GetArrayLength(JDWP::ObjectId array_id, int32_t* length)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError OutputArray(JDWP::ObjectId array_id, int offset, int count,
                                      JDWP::ExpandBuf* pReply)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError SetArrayElements(JDWP::ObjectId array_id, int offset, int count,
-                                          JDWP::Request& request)
+                                          JDWP::Request* request)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  static JDWP::ObjectId CreateString(const std::string& str)
+  static JDWP::JdwpError CreateString(const std::string& str, JDWP::ObjectId* new_string_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static JDWP::JdwpError CreateObject(JDWP::RefTypeId class_id, JDWP::ObjectId& new_object)
+  static JDWP::JdwpError CreateObject(JDWP::RefTypeId class_id, JDWP::ObjectId* new_object_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError CreateArrayObject(JDWP::RefTypeId array_class_id, uint32_t length,
-                                           JDWP::ObjectId& new_array)
+                                           JDWP::ObjectId* new_array_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   //
@@ -316,7 +340,7 @@ class Dbg {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   static bool MatchField(JDWP::RefTypeId expected_type_id, JDWP::FieldId expected_field_id,
-                         mirror::ArtField* event_field)
+                         ArtField* event_field)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   static bool MatchInstance(JDWP::ObjectId expected_instance_id, mirror::Object* event_instance)
@@ -328,12 +352,12 @@ class Dbg {
   static JDWP::JdwpError GetMonitorInfo(JDWP::ObjectId object_id, JDWP::ExpandBuf* reply)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetOwnedMonitors(JDWP::ObjectId thread_id,
-                                          std::vector<JDWP::ObjectId>& monitors,
-                                          std::vector<uint32_t>& stack_depths)
+                                          std::vector<JDWP::ObjectId>* monitors,
+                                          std::vector<uint32_t>* stack_depths)
       LOCKS_EXCLUDED(Locks::thread_list_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetContendedMonitor(JDWP::ObjectId thread_id,
-                                             JDWP::ObjectId& contended_monitor)
+                                             JDWP::ObjectId* contended_monitor)
       LOCKS_EXCLUDED(Locks::thread_list_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
@@ -341,19 +365,19 @@ class Dbg {
   // Heap.
   //
   static JDWP::JdwpError GetInstanceCounts(const std::vector<JDWP::RefTypeId>& class_ids,
-                                           std::vector<uint64_t>& counts)
+                                           std::vector<uint64_t>* counts)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetInstances(JDWP::RefTypeId class_id, int32_t max_count,
-                                      std::vector<JDWP::ObjectId>& instances)
+                                      std::vector<JDWP::ObjectId>* instances)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetReferringObjects(JDWP::ObjectId object_id, int32_t max_count,
-                                             std::vector<JDWP::ObjectId>& referring_objects)
+                                             std::vector<JDWP::ObjectId>* referring_objects)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError DisableCollection(JDWP::ObjectId object_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError EnableCollection(JDWP::ObjectId object_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static JDWP::JdwpError IsCollected(JDWP::ObjectId object_id, bool& is_collected)
+  static JDWP::JdwpError IsCollected(JDWP::ObjectId object_id, bool* is_collected)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void DisposeObject(JDWP::ObjectId object_id, uint32_t reference_count)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -385,7 +409,7 @@ class Dbg {
                                JDWP::ExpandBuf* pReply)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static JDWP::JdwpError GetBytecodes(JDWP::RefTypeId class_id, JDWP::MethodId method_id,
-                                      std::vector<uint8_t>& bytecodes)
+                                      std::vector<uint8_t>* bytecodes)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   static std::string GetFieldName(JDWP::FieldId field_id)
@@ -414,7 +438,7 @@ class Dbg {
   /*
    * Thread, ThreadGroup, Frame
    */
-  static JDWP::JdwpError GetThreadName(JDWP::ObjectId thread_id, std::string& name)
+  static JDWP::JdwpError GetThreadName(JDWP::ObjectId thread_id, std::string* name)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
       LOCKS_EXCLUDED(Locks::thread_list_lock_);
   static JDWP::JdwpError GetThreadGroup(JDWP::ObjectId thread_id, JDWP::ExpandBuf* pReply)
@@ -449,7 +473,7 @@ class Dbg {
       LOCKS_EXCLUDED(Locks::thread_list_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  static JDWP::JdwpError GetThreadFrameCount(JDWP::ObjectId thread_id, size_t& result)
+  static JDWP::JdwpError GetThreadFrameCount(JDWP::ObjectId thread_id, size_t* result)
       LOCKS_EXCLUDED(Locks::thread_list_lock_);
   static JDWP::JdwpError GetThreadFrames(JDWP::ObjectId thread_id, size_t start_frame,
                                          size_t frame_count, JDWP::ExpandBuf* buf)
@@ -494,21 +518,20 @@ class Dbg {
   /*
    * Debugger notification
    */
-  enum {
+  enum EventFlag {
     kBreakpoint     = 0x01,
     kSingleStep     = 0x02,
     kMethodEntry    = 0x04,
     kMethodExit     = 0x08,
   };
   static void PostFieldAccessEvent(mirror::ArtMethod* m, int dex_pc, mirror::Object* this_object,
-                                   mirror::ArtField* f)
+                                   ArtField* f)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void PostFieldModificationEvent(mirror::ArtMethod* m, int dex_pc,
-                                         mirror::Object* this_object, mirror::ArtField* f,
+                                         mirror::Object* this_object, ArtField* f,
                                          const JValue* field_value)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static void PostException(const ThrowLocation& throw_location, mirror::ArtMethod* catch_method,
-                            uint32_t catch_dex_pc, mirror::Throwable* exception)
+  static void PostException(mirror::Throwable* exception)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void PostThreadStart(Thread* t)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -531,13 +554,6 @@ class Dbg {
       LOCKS_EXCLUDED(Locks::deoptimization_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  // Support delayed full undeoptimization requests. This is currently only used for single-step
-  // events.
-  static void DelayFullUndeoptimization() LOCKS_EXCLUDED(Locks::deoptimization_lock_);
-  static void ProcessDelayedFullUndeoptimizations()
-      LOCKS_EXCLUDED(Locks::deoptimization_lock_)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
   // Manage deoptimization after updating JDWP events list. Suspends all threads, processes each
   // request and finally resumes all threads.
   static void ManageDeoptimization()
@@ -552,6 +568,53 @@ class Dbg {
       LOCKS_EXCLUDED(Locks::breakpoint_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+  /*
+   * Forced interpreter checkers for single-step and continue support.
+   */
+
+  // Indicates whether we need to force the use of interpreter to invoke a method.
+  // This allows to single-step or continue into the called method.
+  static bool IsForcedInterpreterNeededForCalling(Thread* thread, mirror::ArtMethod* m)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    if (!IsDebuggerActive()) {
+      return false;
+    }
+    return IsForcedInterpreterNeededForCallingImpl(thread, m);
+  }
+
+  // Indicates whether we need to force the use of interpreter entrypoint when calling a
+  // method through the resolution trampoline. This allows to single-step or continue into
+  // the called method.
+  static bool IsForcedInterpreterNeededForResolution(Thread* thread, mirror::ArtMethod* m)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    if (!IsDebuggerActive()) {
+      return false;
+    }
+    return IsForcedInterpreterNeededForResolutionImpl(thread, m);
+  }
+
+  // Indicates whether we need to force the use of instrumentation entrypoint when calling
+  // a method through the resolution trampoline. This allows to deoptimize the stack for
+  // debugging when we returned from the called method.
+  static bool IsForcedInstrumentationNeededForResolution(Thread* thread, mirror::ArtMethod* m)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    if (!IsDebuggerActive()) {
+      return false;
+    }
+    return IsForcedInstrumentationNeededForResolutionImpl(thread, m);
+  }
+
+  // Indicates whether we need to force the use of interpreter when returning from the
+  // interpreter into the runtime. This allows to deoptimize the stack and continue
+  // execution with interpreter for debugging.
+  static bool IsForcedInterpreterNeededForUpcall(Thread* thread, mirror::ArtMethod* m)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    if (!IsDebuggerActive()) {
+      return false;
+    }
+    return IsForcedInterpreterNeededForUpcallImpl(thread, m);
+  }
+
   // Single-stepping.
   static JDWP::JdwpError ConfigureStep(JDWP::ObjectId thread_id, JDWP::JdwpStepSize size,
                                        JDWP::JdwpStepDepth depth)
@@ -560,6 +623,8 @@ class Dbg {
       LOCKS_EXCLUDED(Locks::thread_list_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+  // Invoke support for commands ClassType.InvokeMethod, ClassType.NewInstance and
+  // ObjectReference.InvokeMethod.
   static JDWP::JdwpError InvokeMethod(JDWP::ObjectId thread_id, JDWP::ObjectId object_id,
                                       JDWP::RefTypeId class_id, JDWP::MethodId method_id,
                                       uint32_t arg_count, uint64_t* arg_values,
@@ -578,7 +643,7 @@ class Dbg {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void DdmSetThreadNotification(bool enable)
       LOCKS_EXCLUDED(Locks::thread_list_lock_);
-  static bool DdmHandlePacket(JDWP::Request& request, uint8_t** pReplyBuf, int* pReplyLen);
+  static bool DdmHandlePacket(JDWP::Request* request, uint8_t** pReplyBuf, int* pReplyLen);
   static void DdmConnected() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void DdmDisconnected() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void DdmSendChunk(uint32_t type, const std::vector<uint8_t>& bytes)
@@ -588,13 +653,13 @@ class Dbg {
   static void DdmSendChunkV(uint32_t type, const iovec* iov, int iov_count)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  static void VisitRoots(RootCallback* callback, void* arg)
+  static void VisitRoots(RootVisitor* visitor)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   /*
    * Recent allocation tracking support.
    */
-  static void RecordAllocation(mirror::Class* type, size_t byte_count)
+  static void RecordAllocation(Thread* self, mirror::Class* type, size_t byte_count)
       LOCKS_EXCLUDED(Locks::alloc_tracker_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void SetAllocTrackingEnabled(bool enabled) LOCKS_EXCLUDED(Locks::alloc_tracker_lock_);
@@ -641,11 +706,17 @@ class Dbg {
   static JDWP::JdwpTypeTag GetTypeTag(mirror::Class* klass)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  static JDWP::FieldId ToFieldId(const mirror::ArtField* f)
+  static JDWP::FieldId ToFieldId(const ArtField* f)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   static void SetJdwpLocation(JDWP::JdwpLocation* location, mirror::ArtMethod* m, uint32_t dex_pc)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  static JDWP::JdwpState* GetJdwpState();
+
+  static uint32_t GetInstrumentationEvents() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return instrumentation_events_;
+  }
 
  private:
   static JDWP::JdwpError GetLocalValue(const StackVisitor& visitor,
@@ -674,11 +745,31 @@ class Dbg {
       EXCLUSIVE_LOCKS_REQUIRED(Locks::deoptimization_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+  static bool IsForcedInterpreterNeededForCallingImpl(Thread* thread, mirror::ArtMethod* m)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  static bool IsForcedInterpreterNeededForResolutionImpl(Thread* thread, mirror::ArtMethod* m)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  static bool IsForcedInstrumentationNeededForResolutionImpl(Thread* thread, mirror::ArtMethod* m)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  static bool IsForcedInterpreterNeededForUpcallImpl(Thread* thread, mirror::ArtMethod* m)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
   static AllocRecord* recent_allocation_records_ PT_GUARDED_BY(Locks::alloc_tracker_lock_);
   static size_t alloc_record_max_ GUARDED_BY(Locks::alloc_tracker_lock_);
   static size_t alloc_record_head_ GUARDED_BY(Locks::alloc_tracker_lock_);
   static size_t alloc_record_count_ GUARDED_BY(Locks::alloc_tracker_lock_);
 
+  // Indicates whether the debugger is making requests.
+  static bool gDebuggerActive;
+
+  // Indicates whether we should drop the JDWP connection because the runtime stops or the
+  // debugger called VirtualMachine.Dispose.
+  static bool gDisposed;
+
+  // The registry mapping objects to JDWP ids.
   static ObjectRegistry* gRegistry;
 
   // Deoptimization requests to be processed each time the event list is updated. This is used when
@@ -692,10 +783,6 @@ class Dbg {
   // Note: we fully deoptimize on the first event only (when the counter is set to 1). We fully
   // undeoptimize when the last event is unregistered (when the counter is set to 0).
   static size_t full_deoptimization_event_count_ GUARDED_BY(Locks::deoptimization_lock_);
-
-  // Count the number of full undeoptimization requests delayed to next resume or end of debug
-  // session.
-  static size_t delayed_full_undeoptimization_count_ GUARDED_BY(Locks::deoptimization_lock_);
 
   static size_t* GetReferenceCounterForEvent(uint32_t instrumentation_event);
 

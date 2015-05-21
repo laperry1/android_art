@@ -19,13 +19,11 @@
 
 #include "compiler_driver.h"
 
-#include "dex/compiler_ir.h"
-#include "field_helper.h"
-#include "mirror/art_field-inl.h"
+#include "art_field-inl.h"
+#include "dex_compilation_unit.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/class_loader.h"
 #include "mirror/dex_cache-inl.h"
-#include "mirror/art_field-inl.h"
 #include "scoped_thread_state_change.h"
 #include "handle_scope-inl.h"
 
@@ -40,6 +38,22 @@ inline mirror::ClassLoader* CompilerDriver::GetClassLoader(ScopedObjectAccess& s
   return soa.Decode<mirror::ClassLoader*>(mUnit->GetClassLoader());
 }
 
+inline mirror::Class* CompilerDriver::ResolveClass(
+    const ScopedObjectAccess& soa, Handle<mirror::DexCache> dex_cache,
+    Handle<mirror::ClassLoader> class_loader, uint16_t cls_index,
+    const DexCompilationUnit* mUnit) {
+  DCHECK_EQ(dex_cache->GetDexFile(), mUnit->GetDexFile());
+  DCHECK_EQ(class_loader.Get(), soa.Decode<mirror::ClassLoader*>(mUnit->GetClassLoader()));
+  mirror::Class* cls = mUnit->GetClassLinker()->ResolveType(
+      *mUnit->GetDexFile(), cls_index, dex_cache, class_loader);
+  DCHECK_EQ(cls == nullptr, soa.Self()->IsExceptionPending());
+  if (UNLIKELY(cls == nullptr)) {
+    // Clean up any exception left by type resolution.
+    soa.Self()->ClearException();
+  }
+  return cls;
+}
+
 inline mirror::Class* CompilerDriver::ResolveCompilingMethodsClass(
     const ScopedObjectAccess& soa, Handle<mirror::DexCache> dex_cache,
     Handle<mirror::ClassLoader> class_loader, const DexCompilationUnit* mUnit) {
@@ -47,24 +61,16 @@ inline mirror::Class* CompilerDriver::ResolveCompilingMethodsClass(
   DCHECK_EQ(class_loader.Get(), soa.Decode<mirror::ClassLoader*>(mUnit->GetClassLoader()));
   const DexFile::MethodId& referrer_method_id =
       mUnit->GetDexFile()->GetMethodId(mUnit->GetDexMethodIndex());
-  mirror::Class* referrer_class = mUnit->GetClassLinker()->ResolveType(
-      *mUnit->GetDexFile(), referrer_method_id.class_idx_, dex_cache, class_loader);
-  DCHECK_EQ(referrer_class == nullptr, soa.Self()->IsExceptionPending());
-  if (UNLIKELY(referrer_class == nullptr)) {
-    // Clean up any exception left by type resolution.
-    soa.Self()->ClearException();
-  }
-  return referrer_class;
+  return ResolveClass(soa, dex_cache, class_loader, referrer_method_id.class_idx_, mUnit);
 }
 
-inline mirror::ArtField* CompilerDriver::ResolveField(
+inline ArtField* CompilerDriver::ResolveFieldWithDexFile(
     const ScopedObjectAccess& soa, Handle<mirror::DexCache> dex_cache,
-    Handle<mirror::ClassLoader> class_loader, const DexCompilationUnit* mUnit,
+    Handle<mirror::ClassLoader> class_loader, const DexFile* dex_file,
     uint32_t field_idx, bool is_static) {
-  DCHECK_EQ(dex_cache->GetDexFile(), mUnit->GetDexFile());
-  DCHECK_EQ(class_loader.Get(), soa.Decode<mirror::ClassLoader*>(mUnit->GetClassLoader()));
-  mirror::ArtField* resolved_field = mUnit->GetClassLinker()->ResolveField(
-      *mUnit->GetDexFile(), field_idx, dex_cache, class_loader, is_static);
+  DCHECK_EQ(dex_cache->GetDexFile(), dex_file);
+  ArtField* resolved_field = Runtime::Current()->GetClassLinker()->ResolveField(
+      *dex_file, field_idx, dex_cache, class_loader, is_static);
   DCHECK_EQ(resolved_field == nullptr, soa.Self()->IsExceptionPending());
   if (UNLIKELY(resolved_field == nullptr)) {
     // Clean up any exception left by type resolution.
@@ -73,14 +79,27 @@ inline mirror::ArtField* CompilerDriver::ResolveField(
   }
   if (UNLIKELY(resolved_field->IsStatic() != is_static)) {
     // ClassLinker can return a field of the wrong kind directly from the DexCache.
-    // Silently return nullptr on such incompatible class change.
+    // Silently return null on such incompatible class change.
     return nullptr;
   }
   return resolved_field;
 }
 
+inline mirror::DexCache* CompilerDriver::FindDexCache(const DexFile* dex_file) {
+  return Runtime::Current()->GetClassLinker()->FindDexCache(*dex_file);
+}
+
+inline ArtField* CompilerDriver::ResolveField(
+    const ScopedObjectAccess& soa, Handle<mirror::DexCache> dex_cache,
+    Handle<mirror::ClassLoader> class_loader, const DexCompilationUnit* mUnit,
+    uint32_t field_idx, bool is_static) {
+  DCHECK_EQ(class_loader.Get(), soa.Decode<mirror::ClassLoader*>(mUnit->GetClassLoader()));
+  return ResolveFieldWithDexFile(soa, dex_cache, class_loader, mUnit->GetDexFile(), field_idx,
+                                 is_static);
+}
+
 inline void CompilerDriver::GetResolvedFieldDexFileLocation(
-    mirror::ArtField* resolved_field, const DexFile** declaring_dex_file,
+    ArtField* resolved_field, const DexFile** declaring_dex_file,
     uint16_t* declaring_class_idx, uint16_t* declaring_field_idx) {
   mirror::Class* declaring_class = resolved_field->GetDeclaringClass();
   *declaring_dex_file = declaring_class->GetDexCache()->GetDexFile();
@@ -88,13 +107,17 @@ inline void CompilerDriver::GetResolvedFieldDexFileLocation(
   *declaring_field_idx = resolved_field->GetDexFieldIndex();
 }
 
-inline bool CompilerDriver::IsFieldVolatile(mirror::ArtField* field) {
+inline bool CompilerDriver::IsFieldVolatile(ArtField* field) {
   return field->IsVolatile();
+}
+
+inline MemberOffset CompilerDriver::GetFieldOffset(ArtField* field) {
+  return field->GetOffset();
 }
 
 inline std::pair<bool, bool> CompilerDriver::IsFastInstanceField(
     mirror::DexCache* dex_cache, mirror::Class* referrer_class,
-    mirror::ArtField* resolved_field, uint16_t field_idx) {
+    ArtField* resolved_field, uint16_t field_idx) {
   DCHECK(!resolved_field->IsStatic());
   mirror::Class* fields_class = resolved_field->GetDeclaringClass();
   bool fast_get = referrer_class != nullptr &&
@@ -104,39 +127,67 @@ inline std::pair<bool, bool> CompilerDriver::IsFastInstanceField(
   return std::make_pair(fast_get, fast_put);
 }
 
-inline std::pair<bool, bool> CompilerDriver::IsFastStaticField(
-    mirror::DexCache* dex_cache, mirror::Class* referrer_class,
-    mirror::ArtField* resolved_field, uint16_t field_idx, MemberOffset* field_offset,
-    uint32_t* storage_index, bool* is_referrers_class, bool* is_initialized) {
-  DCHECK(resolved_field->IsStatic());
+template <typename ArtMember>
+inline bool CompilerDriver::CanAccessResolvedMember(mirror::Class* referrer_class ATTRIBUTE_UNUSED,
+                                                    mirror::Class* access_to ATTRIBUTE_UNUSED,
+                                                    ArtMember* member ATTRIBUTE_UNUSED,
+                                                    mirror::DexCache* dex_cache ATTRIBUTE_UNUSED,
+                                                    uint32_t field_idx ATTRIBUTE_UNUSED) {
+  // Not defined for ArtMember values other than ArtField or mirror::ArtMethod.
+  UNREACHABLE();
+}
+
+template <>
+inline bool CompilerDriver::CanAccessResolvedMember<ArtField>(mirror::Class* referrer_class,
+                                                              mirror::Class* access_to,
+                                                              ArtField* field,
+                                                              mirror::DexCache* dex_cache,
+                                                              uint32_t field_idx) {
+  return referrer_class->CanAccessResolvedField(access_to, field, dex_cache, field_idx);
+}
+
+template <>
+inline bool CompilerDriver::CanAccessResolvedMember<mirror::ArtMethod>(
+    mirror::Class* referrer_class,
+    mirror::Class* access_to,
+    mirror::ArtMethod* method,
+    mirror::DexCache* dex_cache,
+    uint32_t field_idx) {
+  return referrer_class->CanAccessResolvedMethod(access_to, method, dex_cache, field_idx);
+}
+
+template <typename ArtMember>
+inline std::pair<bool, bool> CompilerDriver::IsClassOfStaticMemberAvailableToReferrer(
+    mirror::DexCache* dex_cache,
+    mirror::Class* referrer_class,
+    ArtMember* resolved_member,
+    uint16_t member_idx,
+    uint32_t* storage_index) {
+  DCHECK(resolved_member->IsStatic());
   if (LIKELY(referrer_class != nullptr)) {
-    mirror::Class* fields_class = resolved_field->GetDeclaringClass();
-    if (fields_class == referrer_class) {
-      *field_offset = resolved_field->GetOffset();
-      *storage_index = fields_class->GetDexTypeIndex();
-      *is_referrers_class = true;  // implies no worrying about class initialization
-      *is_initialized = true;
+    mirror::Class* members_class = resolved_member->GetDeclaringClass();
+    if (members_class == referrer_class) {
+      *storage_index = members_class->GetDexTypeIndex();
       return std::make_pair(true, true);
     }
-    if (referrer_class->CanAccessResolvedField(fields_class, resolved_field,
-                                               dex_cache, field_idx)) {
-      // We have the resolved field, we must make it into a index for the referrer
+    if (CanAccessResolvedMember<ArtMember>(
+            referrer_class, members_class, resolved_member, dex_cache, member_idx)) {
+      // We have the resolved member, we must make it into a index for the referrer
       // in its static storage (which may fail if it doesn't have a slot for it)
       // TODO: for images we can elide the static storage base null check
       // if we know there's a non-null entry in the image
       const DexFile* dex_file = dex_cache->GetDexFile();
       uint32_t storage_idx = DexFile::kDexNoIndex;
-      if (LIKELY(fields_class->GetDexCache() == dex_cache)) {
-        // common case where the dex cache of both the referrer and the field are the same,
+      if (LIKELY(members_class->GetDexCache() == dex_cache)) {
+        // common case where the dex cache of both the referrer and the member are the same,
         // no need to search the dex file
-        storage_idx = fields_class->GetDexTypeIndex();
+        storage_idx = members_class->GetDexTypeIndex();
       } else {
-        // Search dex file for localized ssb index, may fail if field's class is a parent
+        // Search dex file for localized ssb index, may fail if member's class is a parent
         // of the class mentioned in the dex file and there is no dex cache entry.
-        StackHandleScope<1> hs(Thread::Current());
+        std::string temp;
         const DexFile::StringId* string_id =
-            dex_file->FindStringId(
-                FieldHelper(hs.NewHandle(resolved_field)).GetDeclaringClassDescriptor());
+            dex_file->FindStringId(resolved_member->GetDeclaringClass()->GetDescriptor(&temp));
         if (string_id != nullptr) {
           const DexFile::TypeId* type_id =
              dex_file->FindTypeId(dex_file->GetIndexForStringId(*string_id));
@@ -147,27 +198,51 @@ inline std::pair<bool, bool> CompilerDriver::IsFastStaticField(
         }
       }
       if (storage_idx != DexFile::kDexNoIndex) {
-        *field_offset = resolved_field->GetOffset();
         *storage_index = storage_idx;
-        *is_referrers_class = false;
-        *is_initialized = fields_class->IsInitialized() &&
-            CanAssumeTypeIsPresentInDexCache(*dex_file, storage_idx);
-        return std::make_pair(true, !resolved_field->IsFinal());
+        return std::make_pair(true, !resolved_member->IsFinal());
       }
     }
   }
   // Conservative defaults.
-  *field_offset = MemberOffset(0u);
   *storage_index = DexFile::kDexNoIndex;
-  *is_referrers_class = false;
-  *is_initialized = false;
   return std::make_pair(false, false);
+}
+
+inline std::pair<bool, bool> CompilerDriver::IsFastStaticField(
+    mirror::DexCache* dex_cache, mirror::Class* referrer_class,
+    ArtField* resolved_field, uint16_t field_idx, uint32_t* storage_index) {
+  return IsClassOfStaticMemberAvailableToReferrer(
+      dex_cache, referrer_class, resolved_field, field_idx, storage_index);
+}
+
+inline bool CompilerDriver::IsClassOfStaticMethodAvailableToReferrer(
+    mirror::DexCache* dex_cache, mirror::Class* referrer_class,
+    mirror::ArtMethod* resolved_method, uint16_t method_idx, uint32_t* storage_index) {
+  std::pair<bool, bool> result = IsClassOfStaticMemberAvailableToReferrer(
+      dex_cache, referrer_class, resolved_method, method_idx, storage_index);
+  // Only the first member of `result` is meaningful, as there is no
+  // "write access" to a method.
+  return result.first;
+}
+
+inline bool CompilerDriver::IsStaticFieldInReferrerClass(mirror::Class* referrer_class,
+                                                         ArtField* resolved_field) {
+  DCHECK(resolved_field->IsStatic());
+  mirror::Class* fields_class = resolved_field->GetDeclaringClass();
+  return referrer_class == fields_class;
+}
+
+inline bool CompilerDriver::IsStaticFieldsClassInitialized(mirror::Class* referrer_class,
+                                                           ArtField* resolved_field) {
+  DCHECK(resolved_field->IsStatic());
+  mirror::Class* fields_class = resolved_field->GetDeclaringClass();
+  return fields_class == referrer_class || fields_class->IsInitialized();
 }
 
 inline mirror::ArtMethod* CompilerDriver::ResolveMethod(
     ScopedObjectAccess& soa, Handle<mirror::DexCache> dex_cache,
     Handle<mirror::ClassLoader> class_loader, const DexCompilationUnit* mUnit,
-    uint32_t method_idx, InvokeType invoke_type) {
+    uint32_t method_idx, InvokeType invoke_type, bool check_incompatible_class_change) {
   DCHECK_EQ(dex_cache->GetDexFile(), mUnit->GetDexFile());
   DCHECK_EQ(class_loader.Get(), soa.Decode<mirror::ClassLoader*>(mUnit->GetClassLoader()));
   mirror::ArtMethod* resolved_method = mUnit->GetClassLinker()->ResolveMethod(
@@ -179,8 +254,9 @@ inline mirror::ArtMethod* CompilerDriver::ResolveMethod(
     soa.Self()->ClearException();
     return nullptr;
   }
-  if (UNLIKELY(resolved_method->CheckIncompatibleClassChange(invoke_type))) {
-    // Silently return nullptr on incompatible class change.
+  if (check_incompatible_class_change &&
+      UNLIKELY(resolved_method->CheckIncompatibleClassChange(invoke_type))) {
+    // Silently return null on incompatible class change.
     return nullptr;
   }
   return resolved_method;
@@ -222,14 +298,14 @@ inline int CompilerDriver::IsFastInvoke(
                                                         target_method->dex_method_index))) {
     return 0;
   }
-
   // Sharpen a virtual call into a direct call when the target is known not to have been
   // overridden (ie is final).
-  bool can_sharpen_virtual_based_on_type =
+  const bool same_dex_file = target_method->dex_file == mUnit->GetDexFile();
+  bool can_sharpen_virtual_based_on_type = same_dex_file &&
       (*invoke_type == kVirtual) && (resolved_method->IsFinal() || methods_class->IsFinal());
   // For invoke-super, ensure the vtable index will be correct to dispatch in the vtable of
   // the super class.
-  bool can_sharpen_super_based_on_type = (*invoke_type == kSuper) &&
+  bool can_sharpen_super_based_on_type = same_dex_file && (*invoke_type == kSuper) &&
       (referrer_class != methods_class) && referrer_class->IsSubClass(methods_class) &&
       resolved_method->GetMethodIndex() < methods_class->GetVTableLength() &&
       (methods_class->GetVTableEntry(resolved_method->GetMethodIndex()) == resolved_method) &&
@@ -238,10 +314,10 @@ inline int CompilerDriver::IsFastInvoke(
   if (can_sharpen_virtual_based_on_type || can_sharpen_super_based_on_type) {
     // Sharpen a virtual call into a direct call. The method_idx is into referrer's
     // dex cache, check that this resolved method is where we expect it.
-    CHECK(target_method->dex_file == mUnit->GetDexFile());
-    DCHECK(dex_cache.Get() == mUnit->GetClassLinker()->FindDexCache(*mUnit->GetDexFile()));
-    CHECK(referrer_class->GetDexCache()->GetResolvedMethod(target_method->dex_method_index) ==
-        resolved_method) << PrettyMethod(resolved_method);
+    CHECK_EQ(target_method->dex_file, mUnit->GetDexFile());
+    DCHECK_EQ(dex_cache.Get(), mUnit->GetClassLinker()->FindDexCache(*mUnit->GetDexFile()));
+    CHECK_EQ(referrer_class->GetDexCache()->GetResolvedMethod(target_method->dex_method_index),
+             resolved_method) << PrettyMethod(resolved_method);
     int stats_flags = kFlagMethodResolved;
     GetCodeAndMethodForDirectCall(/*out*/invoke_type,
                                   kDirect,  // Sharp type
@@ -276,7 +352,7 @@ inline int CompilerDriver::IsFastInvoke(
                                                   target_dex_cache, class_loader,
                                                   NullHandle<mirror::ArtMethod>(), kVirtual);
     }
-    CHECK(called_method != NULL);
+    CHECK(called_method != nullptr);
     CHECK(!called_method->IsAbstract());
     int stats_flags = kFlagMethodResolved;
     GetCodeAndMethodForDirectCall(/*out*/invoke_type,
@@ -312,14 +388,13 @@ inline int CompilerDriver::IsFastInvoke(
   return stats_flags;
 }
 
-inline bool CompilerDriver::NeedsClassInitialization(mirror::Class* referrer_class,
-                                                     mirror::ArtMethod* resolved_method) {
+inline bool CompilerDriver::IsMethodsClassInitialized(mirror::Class* referrer_class,
+                                                      mirror::ArtMethod* resolved_method) {
   if (!resolved_method->IsStatic()) {
-    return false;
+    return true;
   }
   mirror::Class* methods_class = resolved_method->GetDeclaringClass();
-  // NOTE: Unlike in IsFastStaticField(), we don't check CanAssumeTypeIsPresentInDexCache() here.
-  return methods_class != referrer_class && !methods_class->IsInitialized();
+  return methods_class == referrer_class || methods_class->IsInitialized();
 }
 
 }  // namespace art

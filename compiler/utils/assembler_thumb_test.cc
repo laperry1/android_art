@@ -15,9 +15,11 @@
  */
 
 #include <dirent.h>
+#include <errno.h>
 #include <fstream>
-#include <sys/types.h>
 #include <map>
+#include <string.h>
+#include <sys/types.h>
 
 #include "gtest/gtest.h"
 #include "utils/arm/assembler_thumb2.h"
@@ -43,8 +45,6 @@ namespace arm {
 static constexpr bool kPrintResults = false;
 #endif
 
-static const char* TOOL_PREFIX = "arm-linux-androideabi-";
-
 void SetAndroidData() {
   const char* data = getenv("ANDROID_DATA");
   if (data == nullptr) {
@@ -65,74 +65,6 @@ int CompareIgnoringSpace(const char* s1, const char* s2) {
   return *s1 - *s2;
 }
 
-std::string GetAndroidToolsDir() {
-  std::string root;
-  const char* android_build_top = getenv("ANDROID_BUILD_TOP");
-  if (android_build_top != nullptr) {
-    root += android_build_top;
-  } else {
-    // Not set by build server, so default to current directory
-    char* cwd = getcwd(nullptr, 0);
-    setenv("ANDROID_BUILD_TOP", cwd, 1);
-    root += cwd;
-    free(cwd);
-  }
-
-  // Look for "prebuilts"
-  std::string toolsdir = root;
-  struct stat st;
-  while (toolsdir != "") {
-    std::string prebuilts = toolsdir + "/prebuilts";
-    if (stat(prebuilts.c_str(), &st) == 0) {
-       // Found prebuilts.
-       toolsdir += "/prebuilts/gcc/linux-x86/arm";
-       break;
-    }
-    // Not present, move up one dir.
-    size_t slash = toolsdir.rfind('/');
-    if (slash == std::string::npos) {
-      toolsdir = "";
-    } else {
-      toolsdir = toolsdir.substr(0, slash-1);
-    }
-  }
-  bool statok = stat(toolsdir.c_str(), &st) == 0;
-  if (!statok) {
-    return "";      // Use path.
-  }
-
-  DIR* dir = opendir(toolsdir.c_str());
-  if (dir == nullptr) {
-    return "";      // Use path.
-  }
-
-  struct dirent* entry;
-  std::string founddir;
-  double maxversion  = 0;
-
-  // Find the latest version of the arm-eabi tools (biggest version number).
-  // Suffix on toolsdir will be something like "arm-eabi-4.8"
-  while ((entry = readdir(dir)) != nullptr) {
-    std::string subdir = toolsdir + std::string("/") + std::string(entry->d_name);
-    size_t eabi = subdir.find(TOOL_PREFIX);
-    if (eabi != std::string::npos) {
-      std::string suffix = subdir.substr(eabi + strlen(TOOL_PREFIX));
-      double version = strtod(suffix.c_str(), nullptr);
-      if (version > maxversion) {
-        maxversion = version;
-        founddir = subdir;
-      }
-    }
-  }
-  closedir(dir);
-  bool found = founddir != "";
-  if (!found) {
-    return "";      // Use path.
-  }
-
-  return founddir + "/bin/";
-}
-
 void dump(std::vector<uint8_t>& code, const char* testname) {
   // This will only work on the host.  There is no as, objcopy or objdump on the
   // device.
@@ -142,7 +74,7 @@ void dump(std::vector<uint8_t>& code, const char* testname) {
 
   if (!results_ok) {
     setup_results();
-    toolsdir = GetAndroidToolsDir();
+    toolsdir = CommonRuntimeTest::GetAndroidTargetToolsDir(kThumb2);
     SetAndroidData();
     results_ok = true;
   }
@@ -174,23 +106,25 @@ void dump(std::vector<uint8_t>& code, const char* testname) {
   char cmd[1024];
 
   // Assemble the .S
-  snprintf(cmd, sizeof(cmd), "%s%sas %s -o %s.o", toolsdir.c_str(), TOOL_PREFIX, filename, filename);
-  system(cmd);
+  snprintf(cmd, sizeof(cmd), "%sas %s -o %s.o", toolsdir.c_str(), filename, filename);
+  int cmd_result = system(cmd);
+  ASSERT_EQ(cmd_result, 0) << strerror(errno);
 
   // Remove the $d symbols to prevent the disassembler dumping the instructions
   // as .word
-  snprintf(cmd, sizeof(cmd), "%s%sobjcopy -N '$d' %s.o %s.oo", toolsdir.c_str(), TOOL_PREFIX,
-    filename, filename);
-  system(cmd);
+  snprintf(cmd, sizeof(cmd), "%sobjcopy -N '$d' %s.o %s.oo", toolsdir.c_str(), filename, filename);
+  int cmd_result2 = system(cmd);
+  ASSERT_EQ(cmd_result2, 0) << strerror(errno);
 
   // Disassemble.
 
-  snprintf(cmd, sizeof(cmd), "%s%sobjdump -d %s.oo | grep '^  *[0-9a-f][0-9a-f]*:'",
-    toolsdir.c_str(), TOOL_PREFIX, filename);
+  snprintf(cmd, sizeof(cmd), "%sobjdump -d %s.oo | grep '^  *[0-9a-f][0-9a-f]*:'",
+    toolsdir.c_str(), filename);
   if (kPrintResults) {
     // Print the results only, don't check. This is used to generate new output for inserting
     // into the .inc file.
-    system(cmd);
+    int cmd_result3 = system(cmd);
+    ASSERT_EQ(cmd_result3, 0) << strerror(errno);
   } else {
     // Check the results match the appropriate results in the .inc file.
     FILE *fp = popen(cmd, "r");
@@ -296,13 +230,13 @@ TEST(Thumb2AssemblerTest, DataProcessingRegister) {
   // 16 bit variants.
   __ add(R0, R1, ShifterOperand());
   __ sub(R0, R1, ShifterOperand());
-  __ and_(R0, R1, ShifterOperand());
-  __ orr(R0, R1, ShifterOperand());
-  __ eor(R0, R1, ShifterOperand());
-  __ bic(R0, R1, ShifterOperand());
-  __ adc(R0, R1, ShifterOperand());
-  __ sbc(R0, R1, ShifterOperand());
-  __ rsb(R0, R1, ShifterOperand());
+  __ and_(R0, R0, ShifterOperand(R1));
+  __ orr(R0, R0, ShifterOperand(R1));
+  __ eor(R0, R0, ShifterOperand(R1));
+  __ bic(R0, R0, ShifterOperand(R1));
+  __ adc(R0, R0, ShifterOperand(R1));
+  __ sbc(R0, R0, ShifterOperand(R1));
+  __ rsb(R0, R0, ShifterOperand(R1));
 
   __ tst(R0, ShifterOperand(R1));
   __ teq(R0, ShifterOperand(R1));
