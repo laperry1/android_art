@@ -25,6 +25,384 @@
 namespace art {
 namespace arm {
 
+void Thumb2Assembler::Fixup::PrepareDependents(Thumb2Assembler* assembler) {
+  // For each Fixup, it's easy to find the Fixups that it depends on as they are either
+  // the following or the preceding Fixups until we find the target. However, for fixup
+  // adjustment we need the reverse lookup, i.e. what Fixups depend on a given Fixup.
+  // This function creates a compact representation of this relationship, where we have
+  // all the dependents in a single array and Fixups reference their ranges by start
+  // index and count. (Instead of having a per-fixup vector.)
+
+  // Count the number of dependents of each Fixup.
+  const FixupId end_id = assembler->fixups_.size();
+  Fixup* fixups = assembler->fixups_.data();
+  for (FixupId fixup_id = 0u; fixup_id != end_id; ++fixup_id) {
+    uint32_t target = fixups[fixup_id].target_;
+    if (target > fixups[fixup_id].location_) {
+      for (FixupId id = fixup_id + 1u; id != end_id && fixups[id].location_ < target; ++id) {
+        fixups[id].dependents_count_ += 1u;
+      }
+    } else {
+      for (FixupId id = fixup_id; id != 0u && fixups[id - 1u].location_ >= target; --id) {
+        fixups[id - 1u].dependents_count_ += 1u;
+      }
+    }
+  }
+  // Assign index ranges in fixup_dependents_ to individual fixups. Record the end of the
+  // range in dependents_start_, we shall later decrement it as we fill in fixup_dependents_.
+  uint32_t number_of_dependents = 0u;
+  for (FixupId fixup_id = 0u; fixup_id != end_id; ++fixup_id) {
+    number_of_dependents += fixups[fixup_id].dependents_count_;
+    fixups[fixup_id].dependents_start_ = number_of_dependents;
+  }
+  if (number_of_dependents == 0u) {
+    return;
+  }
+  // Create and fill in the fixup_dependents_.
+  assembler->fixup_dependents_.reset(new FixupId[number_of_dependents]);
+  FixupId* dependents = assembler->fixup_dependents_.get();
+  for (FixupId fixup_id = 0u; fixup_id != end_id; ++fixup_id) {
+    uint32_t target = fixups[fixup_id].target_;
+    if (target > fixups[fixup_id].location_) {
+      for (FixupId id = fixup_id + 1u; id != end_id && fixups[id].location_ < target; ++id) {
+        fixups[id].dependents_start_ -= 1u;
+        dependents[fixups[id].dependents_start_] = fixup_id;
+      }
+    } else {
+      for (FixupId id = fixup_id; id != 0u && fixups[id - 1u].location_ >= target; --id) {
+        fixups[id - 1u].dependents_start_ -= 1u;
+        dependents[fixups[id - 1u].dependents_start_] = fixup_id;
+      }
+    }
+  }
+}
+
+void Thumb2Assembler::BindLabel(Label* label, uint32_t bound_pc) {
+  CHECK(!label->IsBound());
+
+  while (label->IsLinked()) {
+    FixupId fixup_id = label->Position();                     // The id for linked Fixup.
+    Fixup* fixup = GetFixup(fixup_id);                        // Get the Fixup at this id.
+    fixup->Resolve(bound_pc);                                 // Fixup can be resolved now.
+    uint32_t fixup_location = fixup->GetLocation();
+    uint16_t next = buffer_.Load<uint16_t>(fixup_location);   // Get next in chain.
+    buffer_.Store<int16_t>(fixup_location, 0);
+    label->position_ = next;                                  // Move to next.
+  }
+  label->BindTo(bound_pc);
+}
+
+void Thumb2Assembler::BindLiterals() {
+  // We don't add the padding here, that's done only after adjusting the Fixup sizes.
+  uint32_t code_size = buffer_.Size();
+  for (Literal& lit : literals_) {
+    Label* label = lit.GetLabel();
+    BindLabel(label, code_size);
+    code_size += lit.GetSize();
+  }
+}
+
+void Thumb2Assembler::AdjustFixupIfNeeded(Fixup* fixup, uint32_t* current_code_size,
+                                          std::deque<FixupId>* fixups_to_recalculate) {
+  uint32_t adjustment = fixup->AdjustSizeIfNeeded(*current_code_size);
+  if (adjustment != 0u) {
+    *current_code_size += adjustment;
+    for (FixupId dependent_id : fixup->Dependents(*this)) {
+      Fixup* dependent = GetFixup(dependent_id);
+      dependent->IncreaseAdjustment(adjustment);
+      if (buffer_.Load<int16_t>(dependent->GetLocation()) == 0) {
+        buffer_.Store<int16_t>(dependent->GetLocation(), 1);
+        fixups_to_recalculate->push_back(dependent_id);
+      }
+    }
+  }
+}
+
+uint32_t Thumb2Assembler::AdjustFixups() {
+  Fixup::PrepareDependents(this);
+  uint32_t current_code_size = buffer_.Size();
+  std::deque<FixupId> fixups_to_recalculate;
+  if (kIsDebugBuild) {
+    // We will use the placeholders in the buffer_ to mark whether the fixup has
+    // been added to the fixups_to_recalculate. Make sure we start with zeros.
+    for (Fixup& fixup : fixups_) {
+      CHECK_EQ(buffer_.Load<int16_t>(fixup.GetLocation()), 0);
+    }
+  }
+  for (Fixup& fixup : fixups_) {
+    AdjustFixupIfNeeded(&fixup, &current_code_size, &fixups_to_recalculate);
+  }
+  while (!fixups_to_recalculate.empty()) {
+    // Pop the fixup.
+    FixupId fixup_id = fixups_to_recalculate.front();
+    fixups_to_recalculate.pop_front();
+    Fixup* fixup = GetFixup(fixup_id);
+    DCHECK_NE(buffer_.Load<int16_t>(fixup->GetLocation()), 0);
+    buffer_.Store<int16_t>(fixup->GetLocation(), 0);
+    // See if it needs adjustment.
+    AdjustFixupIfNeeded(fixup, &current_code_size, &fixups_to_recalculate);
+  }
+  if (kIsDebugBuild) {
+    // Check that no fixup is marked as being in fixups_to_recalculate anymore.
+    for (Fixup& fixup : fixups_) {
+      CHECK_EQ(buffer_.Load<int16_t>(fixup.GetLocation()), 0);
+    }
+  }
+
+  // Adjust literal pool labels for padding.
+  DCHECK_EQ(current_code_size & 1u, 0u);
+  uint32_t literals_adjustment = current_code_size + (current_code_size & 2) - buffer_.Size();
+  if (literals_adjustment != 0u) {
+    for (Literal& literal : literals_) {
+      Label* label = literal.GetLabel();
+      DCHECK(label->IsBound());
+      int old_position = label->Position();
+      label->Reinitialize();
+      label->BindTo(old_position + literals_adjustment);
+    }
+  }
+
+  return current_code_size;
+}
+
+void Thumb2Assembler::EmitFixups(uint32_t adjusted_code_size) {
+  // Move non-fixup code to its final place and emit fixups.
+  // Process fixups in reverse order so that we don't repeatedly move the same data.
+  size_t src_end = buffer_.Size();
+  size_t dest_end = adjusted_code_size;
+  buffer_.Resize(dest_end);
+  DCHECK_GE(dest_end, src_end);
+  for (auto i = fixups_.rbegin(), end = fixups_.rend(); i != end; ++i) {
+    Fixup* fixup = &*i;
+    if (fixup->GetOriginalSize() == fixup->GetSize()) {
+      // The size of this Fixup didn't change. To avoid moving the data
+      // in small chunks, emit the code to its original position.
+      fixup->Emit(&buffer_, adjusted_code_size);
+      fixup->Finalize(dest_end - src_end);
+    } else {
+      // Move the data between the end of the fixup and src_end to its final location.
+      size_t old_fixup_location = fixup->GetLocation();
+      size_t src_begin = old_fixup_location + fixup->GetOriginalSizeInBytes();
+      size_t data_size = src_end - src_begin;
+      size_t dest_begin  = dest_end - data_size;
+      buffer_.Move(dest_begin, src_begin, data_size);
+      src_end = old_fixup_location;
+      dest_end = dest_begin - fixup->GetSizeInBytes();
+      // Finalize the Fixup and emit the data to the new location.
+      fixup->Finalize(dest_end - src_end);
+      fixup->Emit(&buffer_, adjusted_code_size);
+    }
+  }
+  CHECK_EQ(src_end, dest_end);
+}
+
+void Thumb2Assembler::EmitLiterals() {
+  if (!literals_.empty()) {
+    // Load literal instructions (LDR, LDRD, VLDR) require 4-byte alignment.
+    // We don't support byte and half-word literals.
+    uint32_t code_size = buffer_.Size();
+    DCHECK_EQ(code_size & 1u, 0u);
+    if ((code_size & 2u) != 0u) {
+      Emit16(0);
+    }
+    for (Literal& literal : literals_) {
+      AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+      DCHECK_EQ(static_cast<size_t>(literal.GetLabel()->Position()), buffer_.Size());
+      DCHECK(literal.GetSize() == 4u || literal.GetSize() == 8u);
+      for (size_t i = 0, size = literal.GetSize(); i != size; ++i) {
+        buffer_.Emit<uint8_t>(literal.GetData()[i]);
+      }
+    }
+  }
+}
+
+inline int16_t Thumb2Assembler::BEncoding16(int32_t offset, Condition cond) {
+  DCHECK_EQ(offset & 1, 0);
+  int16_t encoding = B15 | B14;
+  if (cond != AL) {
+    DCHECK(IsInt<9>(offset));
+    encoding |= B12 |  (static_cast<int32_t>(cond) << 8) | ((offset >> 1) & 0xff);
+  } else {
+    DCHECK(IsInt<12>(offset));
+    encoding |= B13 | ((offset >> 1) & 0x7ff);
+  }
+  return encoding;
+}
+
+inline int32_t Thumb2Assembler::BEncoding32(int32_t offset, Condition cond) {
+  DCHECK_EQ(offset & 1, 0);
+  int32_t s = (offset >> 31) & 1;   // Sign bit.
+  int32_t encoding = B31 | B30 | B29 | B28 | B15 |
+      (s << 26) |                   // Sign bit goes to bit 26.
+      ((offset >> 1) & 0x7ff);      // imm11 goes to bits 0-10.
+  if (cond != AL) {
+    DCHECK(IsInt<21>(offset));
+    // Encode cond, move imm6 from bits 12-17 to bits 16-21 and move J1 and J2.
+    encoding |= (static_cast<int32_t>(cond) << 22) | ((offset & 0x3f000) << (16 - 12)) |
+        ((offset & (1 << 19)) >> (19 - 13)) |   // Extract J1 from bit 19 to bit 13.
+        ((offset & (1 << 18)) >> (18 - 11));    // Extract J2 from bit 18 to bit 11.
+  } else {
+    DCHECK(IsInt<25>(offset));
+    int32_t j1 = ((offset >> 23) ^ s ^ 1) & 1;  // Calculate J1 from I1 extracted from bit 23.
+    int32_t j2 = ((offset >> 22)^ s ^ 1) & 1;   // Calculate J2 from I2 extracted from bit 22.
+    // Move imm10 from bits 12-21 to bits 16-25 and add J1 and J2.
+    encoding |= B12 | ((offset & 0x3ff000) << (16 - 12)) |
+        (j1 << 13) | (j2 << 11);
+  }
+  return encoding;
+}
+
+inline int16_t Thumb2Assembler::CbxzEncoding16(Register rn, int32_t offset, Condition cond) {
+  DCHECK(!IsHighRegister(rn));
+  DCHECK_EQ(offset & 1, 0);
+  DCHECK(IsUint<7>(offset));
+  DCHECK(cond == EQ || cond == NE);
+  return B15 | B13 | B12 | B8 | (cond == NE ? B11 : 0) | static_cast<int32_t>(rn) |
+      ((offset & 0x3e) << (3 - 1)) |    // Move imm5 from bits 1-5 to bits 3-7.
+      ((offset & 0x40) << (9 - 6));     // Move i from bit 6 to bit 11
+}
+
+inline int16_t Thumb2Assembler::CmpRnImm8Encoding16(Register rn, int32_t value) {
+  DCHECK(!IsHighRegister(rn));
+  DCHECK(IsUint<8>(value));
+  return B13 | B11 | (rn << 8) | value;
+}
+
+inline int16_t Thumb2Assembler::AddRdnRmEncoding16(Register rdn, Register rm) {
+  // The high bit of rn is moved across 4-bit rm.
+  return B14 | B10 | (static_cast<int32_t>(rm) << 3) |
+      (static_cast<int32_t>(rdn) & 7) | ((static_cast<int32_t>(rdn) & 8) << 4);
+}
+
+inline int32_t Thumb2Assembler::MovwEncoding32(Register rd, int32_t value) {
+  DCHECK(IsUint<16>(value));
+  return B31 | B30 | B29 | B28 | B25 | B22 |
+      (static_cast<int32_t>(rd) << 8) |
+      ((value & 0xf000) << (16 - 12)) |   // Move imm4 from bits 12-15 to bits 16-19.
+      ((value & 0x0800) << (26 - 11)) |   // Move i from bit 11 to bit 26.
+      ((value & 0x0700) << (12 - 8)) |    // Move imm3 from bits 8-10 to bits 12-14.
+      (value & 0xff);                     // Keep imm8 in bits 0-7.
+}
+
+inline int32_t Thumb2Assembler::MovtEncoding32(Register rd, int32_t value) {
+  DCHECK_EQ(value & 0xffff, 0);
+  int32_t movw_encoding = MovwEncoding32(rd, (value >> 16) & 0xffff);
+  return movw_encoding | B25 | B23;
+}
+
+inline int32_t Thumb2Assembler::MovModImmEncoding32(Register rd, int32_t value) {
+  uint32_t mod_imm = ModifiedImmediate(value);
+  DCHECK_NE(mod_imm, kInvalidModifiedImmediate);
+  return B31 | B30 | B29 | B28 | B22 | B19 | B18 | B17 | B16 |
+      (static_cast<int32_t>(rd) << 8) | static_cast<int32_t>(mod_imm);
+}
+
+inline int16_t Thumb2Assembler::LdrLitEncoding16(Register rt, int32_t offset) {
+  DCHECK(!IsHighRegister(rt));
+  DCHECK_EQ(offset & 3, 0);
+  DCHECK(IsUint<10>(offset));
+  return B14 | B11 | (static_cast<int32_t>(rt) << 8) | (offset >> 2);
+}
+
+inline int32_t Thumb2Assembler::LdrLitEncoding32(Register rt, int32_t offset) {
+  // NOTE: We don't support negative offset, i.e. U=0 (B23).
+  return LdrRtRnImm12Encoding(rt, PC, offset);
+}
+
+inline int32_t Thumb2Assembler::LdrdEncoding32(Register rt, Register rt2, Register rn, int32_t offset) {
+  DCHECK_EQ(offset & 3, 0);
+  CHECK(IsUint<10>(offset));
+  return B31 | B30 | B29 | B27 |
+      B24 /* P = 1 */ | B23 /* U = 1 */ | B22 | 0 /* W = 0 */ | B20 |
+      (static_cast<int32_t>(rn) << 16) | (static_cast<int32_t>(rt) << 12) |
+      (static_cast<int32_t>(rt2) << 8) | (offset >> 2);
+}
+
+inline int32_t Thumb2Assembler::VldrsEncoding32(SRegister sd, Register rn, int32_t offset) {
+  DCHECK_EQ(offset & 3, 0);
+  CHECK(IsUint<10>(offset));
+  return B31 | B30 | B29 | B27 | B26 | B24 |
+      B23 /* U = 1 */ | B20 | B11 | B9 |
+      (static_cast<int32_t>(rn) << 16) |
+      ((static_cast<int32_t>(sd) & 0x01) << (22 - 0)) |   // Move D from bit 0 to bit 22.
+      ((static_cast<int32_t>(sd) & 0x1e) << (12 - 1)) |   // Move Vd from bits 1-4 to bits 12-15.
+      (offset >> 2);
+}
+
+inline int32_t Thumb2Assembler::VldrdEncoding32(DRegister dd, Register rn, int32_t offset) {
+  DCHECK_EQ(offset & 3, 0);
+  CHECK(IsUint<10>(offset));
+  return B31 | B30 | B29 | B27 | B26 | B24 |
+      B23 /* U = 1 */ | B20 | B11 | B9 | B8 |
+      (rn << 16) |
+      ((static_cast<int32_t>(dd) & 0x10) << (22 - 4)) |   // Move D from bit 4 to bit 22.
+      ((static_cast<int32_t>(dd) & 0x0f) << (12 - 0)) |   // Move Vd from bits 0-3 to bits 12-15.
+      (offset >> 2);
+}
+
+inline int16_t Thumb2Assembler::LdrRtRnImm5Encoding16(Register rt, Register rn, int32_t offset) {
+  DCHECK(!IsHighRegister(rt));
+  DCHECK(!IsHighRegister(rn));
+  DCHECK_EQ(offset & 3, 0);
+  DCHECK(IsUint<7>(offset));
+  return B14 | B13 | B11 |
+      (static_cast<int32_t>(rn) << 3) | static_cast<int32_t>(rt) |
+      (offset << (6 - 2));                // Move imm5 from bits 2-6 to bits 6-10.
+}
+
+int32_t Thumb2Assembler::Fixup::LoadWideOrFpEncoding(Register rbase, int32_t offset) const {
+  switch (type_) {
+    case kLoadLiteralWide:
+      return LdrdEncoding32(rn_, rt2_, rbase, offset);
+    case kLoadFPLiteralSingle:
+      return VldrsEncoding32(sd_, rbase, offset);
+    case kLoadFPLiteralDouble:
+      return VldrdEncoding32(dd_, rbase, offset);
+    default:
+      LOG(FATAL) << "Unexpected type: " << static_cast<int>(type_);
+      UNREACHABLE();
+  }
+}
+
+inline int32_t Thumb2Assembler::LdrRtRnImm12Encoding(Register rt, Register rn, int32_t offset) {
+  DCHECK(IsUint<12>(offset));
+  return B31 | B30 | B29 | B28 | B27 | B23 | B22 | B20 | (rn << 16) | (rt << 12) | offset;
+}
+
+void Thumb2Assembler::FinalizeCode() {
+  ArmAssembler::FinalizeCode();
+  BindLiterals();
+  uint32_t adjusted_code_size = AdjustFixups();
+  EmitFixups(adjusted_code_size);
+  EmitLiterals();
+}
+
+bool Thumb2Assembler::ShifterOperandCanHold(Register rd ATTRIBUTE_UNUSED,
+                                            Register rn ATTRIBUTE_UNUSED,
+                                            Opcode opcode,
+                                            uint32_t immediate,
+                                            ShifterOperand* shifter_op) {
+  shifter_op->type_ = ShifterOperand::kImmediate;
+  shifter_op->immed_ = immediate;
+  shifter_op->is_shift_ = false;
+  shifter_op->is_rotate_ = false;
+  switch (opcode) {
+    case ADD:
+    case SUB:
+      if (immediate < (1 << 12)) {    // Less than (or equal to) 12 bits can always be done.
+        return true;
+      }
+      return ArmAssembler::ModifiedImmediate(immediate) != kInvalidModifiedImmediate;
+
+    case MOV:
+      // TODO: Support less than or equal to 12bits.
+      return ArmAssembler::ModifiedImmediate(immediate) != kInvalidModifiedImmediate;
+    case MVN:
+    default:
+      return ArmAssembler::ModifiedImmediate(immediate) != kInvalidModifiedImmediate;
+  }
+}
+
 void Thumb2Assembler::and_(Register rd, Register rn, const ShifterOperand& so,
                            Condition cond) {
   EmitDataProcessing(cond, AND, 0, rn, rd, so);
