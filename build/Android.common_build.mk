@@ -190,7 +190,8 @@ ifeq ($(ART_SEA_IR_MODE),true)
 endif
 
 art_non_debug_cflags := \
-  -O2 
+  -Ofast \
+  -fno-fast-math 
 
 art_host_non_debug_cflags := \
   $(art_non_debug_cflags)
