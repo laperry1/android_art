@@ -186,8 +186,7 @@ ifeq ($(ART_SEA_IR_MODE),true)
 endif
 
 art_non_debug_cflags := \
-  -O3 \
-  -lto
+  -O2 
 
 art_host_non_debug_cflags := \
   $(art_non_debug_cflags)
@@ -283,7 +282,7 @@ endif
 
 # Addition CPU specific CFLAGS.
 ifeq ($(TARGET_ARCH),arm)
-  ifneq ($(filter cortex-a15, $(TARGET_CPU_VARIANT)),)
+  ifneq ($(filter cortex-a15 krait, $(TARGET_CPU_VARIANT)),)
     # Fake a ARM feature for LPAE support.
     ART_TARGET_CFLAGS += -D__ARM_FEATURE_LPAE=1
   endif
