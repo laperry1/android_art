@@ -191,7 +191,7 @@ endif
 
 art_non_debug_cflags := \
   -Ofast \
-  -fno-fast-math 
+  -fno-fast-math -Wno-inline
 
 art_host_non_debug_cflags := \
   $(art_non_debug_cflags)
