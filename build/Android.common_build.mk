@@ -86,7 +86,7 @@ endif
 #
 # Used to enable optimizing compiler
 #
-ART_USE_OPTIMIZING_COMPILER := false
+ART_USE_OPTIMIZING_COMPILER := true
 ifneq ($(wildcard art/USE_OPTIMIZING_COMPILER),)
 $(info Enabling ART_USE_OPTIMIZING_COMPILER because of existence of art/USE_OPTIMIZING_COMPILER)
 ART_USE_OPTIMIZING_COMPILER := true
@@ -211,7 +211,7 @@ ART_TARGET_CLANG_CFLAGS_arm64 += \
 art_debug_cflags := \
   -O1 \
   -DDYNAMIC_ANNOTATIONS_ENABLED=1 \
-  -UNDEBUG
+  -DNDEBUG
 
 ifndef LIBART_IMG_HOST_BASE_ADDRESS
   $(error LIBART_IMG_HOST_BASE_ADDRESS unset)
