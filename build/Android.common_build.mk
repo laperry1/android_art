@@ -214,16 +214,7 @@ ART_TARGET_CLANG_CFLAGS_arm64 += \
   -fno-vectorize
 # Force non-debug always
 art_debug_cflags := \
-<<<<<<< HEAD
-  $(art_non_debug_cflags)
-=======
-  -O1 \
-  -DDYNAMIC_ANNOTATIONS_ENABLED=1 \
-  -DNDEBUG
-<<<<<<< HEAD
-=======
->>>>>>> art/cm-12.1
->>>>>>> 9962cce84a2309ca24b705fcc8c8106f7e2185f5
+$(art_non_debug_cflags)
 
 ifndef LIBART_IMG_HOST_BASE_ADDRESS
   $(error LIBART_IMG_HOST_BASE_ADDRESS unset)
