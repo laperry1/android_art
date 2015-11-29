@@ -211,7 +211,7 @@ else
   # Default is 64
   art_cflags += -DIMT_SIZE=64
 endif
-
+ART_USE_OPTIMIZING_COMPILER := true
 ifeq ($(ART_USE_OPTIMIZING_COMPILER),true)
   art_cflags += -DART_USE_OPTIMIZING_COMPILER=1
 endif
@@ -234,10 +234,7 @@ art_non_debug_cflags := \
 
 # Cflags for debug ART and ART tools.
 art_debug_cflags := \
-  -O2 \
-  -DDYNAMIC_ANNOTATIONS_ENABLED=1 \
-  -DVIXL_DEBUG \
-  -UNDEBUG
+  -O2 
 
 art_host_non_debug_cflags := $(art_non_debug_cflags)
 art_target_non_debug_cflags := $(art_non_debug_cflags)
