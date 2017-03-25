@@ -212,6 +212,12 @@ define build-libart-compiler
     LOCAL_SHARED_LIBRARIES += libartd
   endif
 
+  ifeq ($(shell test $(GCC_VERSION) -ge 60 && echo 1), 1)
+  CFLAGS_BASE_DRIVER += -Wno-shift-negative-value
+  endif
+  
+  LOCAL_CFLAGS := -Wno-error=switch	\
+  
   LOCAL_MODULE_TAGS := optional
   LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 
